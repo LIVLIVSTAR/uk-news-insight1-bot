@@ -1,350 +1,554 @@
-import os
-import re
-import hashlib
-import sqlite3
 import asyncio
-from datetime import datetime, timezone
+import hashlib
+import logging
+import os
+import signal
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
 
-import feedparser
-from rapidfuzz import fuzz
+import aiohttp
+import aiosqlite
+from difflib import SequenceMatcher
 from telegram import Bot
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TimedOut, NetworkError
 
+# =========================
+# Configuration & constants
+# =========================
 
-# ---------------- CONFIG ----------------
-BREAKING_CHAT_ID = int(os.getenv("BREAKING_CHAT_ID", "-1003118967605"))
-MACRO_CHAT_ID    = int(os.getenv("MACRO_CHAT_ID", "-1003153326236"))
-SPORTS_CHAT_ID   = int(os.getenv("SPORTS_CHAT_ID", "-1001803566974"))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("uk_news_bot")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BREAKING_CHAT_ID = int(os.getenv("BREAKING_CHAT_ID", "0"))
+MACRO_CHAT_ID = int(os.getenv("MACRO_CHAT_ID", "0"))
+SPORTS_CHAT_ID = int(os.getenv("SPORTS_CHAT_ID", "0"))
 
-POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "600"))   # 10 min default
-SIM_THRESHOLD    = int(os.getenv("SIM_THRESHOLD", "92"))   # 0..100
-RECENT_LIMIT     = int(os.getenv("RECENT_LIMIT", "600"))   # soft-dedup memory
-EVENT_TTL_HOURS  = int(os.getenv("EVENT_TTL_HOURS", "24")) # event-level dedup window
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "600"))  # default 10 minutes
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.92"))  # 0–1 range
 
-# Keep ONLY 2 hashtags at end of each post (network standard)
-CHANNEL_HASHTAGS = {
-    "breaking": ("#Breaking", "#UK"),
-    "macro":    ("#Macro", "#UK"),
-    "sports":   ("#Sports", "#UK"),
-}
+DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 
-CHANNEL_CHAT_ID = {
-    "breaking": BREAKING_CHAT_ID,
-    "macro":    MACRO_CHAT_ID,
-    "sports":   SPORTS_CHAT_ID,
-}
-
-bot = Bot(token=BOT_TOKEN)
-
-BREAKING_FEEDS = [
-    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/front_page/rss.xml",
-    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/uk/rss.xml",
-    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/world/rss.xml",
-    "https://feeds.skynews.com/feeds/rss/home.xml",
+# RSS feeds (UK-focused)
+RSS_FEEDS = [
+    # BBC
+    "https://feeds.bbci.co.uk/news/uk/rss.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.bbci.co.uk/sport/rss.xml",
+    # Sky News
     "https://feeds.skynews.com/feeds/rss/uk.xml",
     "https://feeds.skynews.com/feeds/rss/world.xml",
+    # ONS (statistical bulletins)
+    "https://www.ons.gov.uk/rss",
 ]
 
-MACRO_FEEDS = [
-    "http://newsrss.bbc.co.uk/rss/newsonline_uk_edition/business/rss.xml",
-    "https://www.ons.gov.uk/ons/media-centre/rss.xml",
-]
-
-SPORTS_FEEDS = [
-    "https://feeds.bbci.co.uk/sport/rss.xml",
-]
+# How far back to check for fuzzy duplicates
+FUZZY_LOOKBACK_MINUTES = 180  # last 3 hours
 
 
-# ---------------- DB (persistent dedup) ----------------
-DB_PATH = "state.db"
-
-def db_init():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-
-    # hard dedup (title+link)
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS posted (
-        k TEXT PRIMARY KEY,
-        norm TEXT,
-        ts TEXT
-      )
-    """)
-
-    # event-level dedup (story family)
-    cur.execute("""
-      CREATE TABLE IF NOT EXISTS events (
-        ek TEXT PRIMARY KEY,
-        ts TEXT
-      )
-    """)
-
-    con.commit()
-    con.close()
-
-def db_has_key(k: str) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM posted WHERE k=? LIMIT 1", (k,))
-    row = cur.fetchone()
-    con.close()
-    return row is not None
-
-def db_insert_posted(k: str, norm: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO posted (k, norm, ts) VALUES (?, ?, ?)",
-        (k, norm, datetime.now(timezone.utc).isoformat())
-    )
-    con.commit()
-    con.close()
-
-def db_recent_norms(limit: int = 600):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT norm FROM posted ORDER BY ts DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    con.close()
-    return [r[0] for r in rows if r and r[0]]
-
-def db_event_seen_recent(ek: str) -> bool:
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT 1 FROM events
-        WHERE ek = ?
-          AND ts >= datetime('now', ?)
-        LIMIT 1
-    """, (ek, f"-{EVENT_TTL_HOURS} hours"))
-    row = cur.fetchone()
-    con.close()
-    return row is not None
-
-def db_event_touch(ek: str):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO events (ek, ts) VALUES (?, ?)",
-        (ek, datetime.now(timezone.utc).isoformat())
-    )
-    con.commit()
-    con.close()
-
-def db_events_cleanup():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM events WHERE ts < datetime('now', ?)", (f"-{EVENT_TTL_HOURS} hours",))
-    con.commit()
-    con.close()
+@dataclass
+class NewsItem:
+    title: str
+    link: str
+    source: str
+    published: Optional[datetime]
 
 
-# ---------------- HELPERS ----------------
-def normalize(text: str) -> str:
-    t = (text or "").lower()
-    t = re.sub(r"[\W_]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# =========================
+# Database & deduplication
+# =========================
 
-def make_key(title: str, link: str) -> str:
-    base = (normalize(title) + "|" + (link or "")).encode("utf-8")
-    return hashlib.sha256(base).hexdigest()
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS news_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    link TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+"""
 
-def clean_html(text: str) -> str:
-    s = text or ""
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+INSERT_ITEM_SQL = """
+INSERT INTO news_items (hash, title, link, created_at)
+VALUES (?, ?, ?, ?);
+"""
 
-def extract_summary(entry) -> str:
-    return clean_html(
-        entry.get("summary")
-        or entry.get("description")
-        or entry.get("subtitle")
-        or ""
-    )
-
-# Strict-ish keywords
-SPORTS_KW = [
-    "premier league", "football", "match", "goal", "injury", "transfer",
-    "manager", "coach", "champions league", "fa cup", "rugby", "cricket", "tennis",
-]
-
-MACRO_KW = [
-    "inflation", "cpi", "ppi", "gdp", "interest rate", "rates", "rate cut", "rate hike",
-    "bank of england", "boe", "unemployment", "wages", "pay growth", "recession",
-    "bond", "yield", "gilt", "sterling", "gbp", "budget", "tax",
-]
-
-def classify(source: str, title: str, summary: str) -> str:
-    n = normalize(f"{title} {summary}")
-    s = (source or "").lower()
-
-    if "sport" in s or any(k in n for k in SPORTS_KW):
-        return "sports"
-
-    if any(k in n for k in MACRO_KW):
-        return "macro"
-
-    return "breaking"
+SELECT_RECENT_TITLES_SQL = """
+SELECT title FROM news_items
+WHERE created_at >= ?;
+"""
 
 
-# ---------------- EVENT-LEVEL DEDUP ----------------
-STOPWORDS = {
-    # common news filler words (EN)
-    "watch", "live", "update", "latest", "video", "photos", "explained",
-    "what", "we", "know", "about", "why", "how", "after", "as", "at", "in",
-    "on", "to", "of", "and", "a", "an", "the", "for", "with", "from",
-    "says", "say", "told", "report", "reports", "scene", "new", "more",
-    "than", "least", "near", "city", "worst", "disaster", "decade",
-}
-
-def make_event_key(title: str) -> str:
-    """
-    Group related headlines about the same story.
-    Designed to suppress BBC-style multi-posts (Watch / What we know / survivors say...)
-    """
-    t = normalize(title)
-
-    # remove common prefix patterns
-    t = re.sub(r"^(watch|live|update)\s*:\s*", "", t).strip()
-    t = re.sub(r"^what we know about\s+", "", t).strip()
-
-    tokens = [x for x in t.split() if len(x) >= 4 and x not in STOPWORDS]
-
-    # keep strongest tokens only; sort for order-invariance
-    tokens = sorted(set(tokens[:12]))
-
-    base = " ".join(tokens)[:140]
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+async def init_db(db_path: str = DB_PATH) -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(db_path)
+    await conn.execute(CREATE_TABLE_SQL)
+    await conn.commit()
+    return conn
 
 
-# ---------------- FORMAT (NO EMOJIS / NO EXTRA TAGS) ----------------
-def format_post(channel: str, title: str, source: str, summary: str) -> str:
-    tag1, tag2 = CHANNEL_HASHTAGS[channel]
-
-    t = (title or "").strip()
-    s = (source or "RSS").strip()
-
-    ctx = clean_html(summary)
-    ctx_line = ""
-    if ctx:
-        # keep context short, and only if it adds something different from title
-        if len(ctx) > 180:
-            ctx = ctx[:177].rstrip() + "…"
-        if fuzz.partial_ratio(normalize(ctx), normalize(t)) < 85:
-            ctx_line = ctx
-
-    parts = [
-        t,
-        f"— {s}",
-    ]
-    first_line = " ".join(parts).strip()
-
-    if ctx_line:
-        body = first_line + "\n" + ctx_line
-    else:
-        body = first_line
-
-    return "\n".join([
-        body.strip(),
-        "",
-        f"{tag1} {tag2}",
-    ]).strip()
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().strip().split())
 
 
-# ---------------- TELEGRAM SEND ----------------
-async def send(channel: str, text: str):
-    while True:
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_CHAT_ID[channel],
-                text=text,
-                disable_web_page_preview=True
+def compute_hash(title: str, link: str) -> str:
+    normalized = normalize_text(title) + "|" + link.strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+async def is_duplicate(
+    conn: aiosqlite.Connection,
+    item: NewsItem,
+    sim_threshold: float = SIM_THRESHOLD,
+) -> bool:
+    """Check exact hash and fuzzy similarity against recent titles."""
+    h = compute_hash(item.title, item.link)
+
+    # Exact hash check
+    try:
+        await conn.execute("SELECT 1 FROM news_items WHERE hash = ?;", (h,))
+        cursor = await conn.execute("SELECT 1 FROM news_items WHERE hash = ?;", (h,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            logger.debug("Duplicate by hash: %s", item.title)
+            return True
+    except Exception as e:
+        logger.exception("Error checking hash duplicate: %s", e)
+
+    # Fuzzy similarity check against recent titles
+    cutoff_time = datetime.utcnow() - timedelta(minutes=FUZZY_LOOKBACK_MINUTES)
+    try:
+        cursor = await conn.execute(
+            SELECT_RECENT_TITLES_SQL,
+            (cutoff_time.isoformat(),),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+    except Exception as e:
+        logger.exception("Error fetching recent titles for fuzzy dedup: %s", e)
+        rows = []
+
+    normalized_new = normalize_text(item.title)
+    for (existing_title,) in rows:
+        ratio = SequenceMatcher(
+            None, normalized_new, normalize_text(existing_title)
+        ).ratio()
+        if ratio >= sim_threshold:
+            logger.debug(
+                "Duplicate by fuzzy match (%.3f): %s ~ %s",
+                ratio,
+                item.title,
+                existing_title,
             )
-            return
-        except RetryAfter as e:
-            wait_s = int(getattr(e, "retry_after", 10))
-            print(f"Rate-limited by Telegram. Sleeping {wait_s}s…")
-            await asyncio.sleep(wait_s + 1)
-        except Exception as e:
-            print(f"Telegram send error: {e}")
-            await asyncio.sleep(5)
+            return True
+
+    return False
 
 
-# ---------------- FETCH RSS ITEMS ----------------
-def fetch_items():
-    """
-    Returns list of tuples: (source_title, title, link, summary)
-    """
-    items = []
+async def store_item(conn: aiosqlite.Connection, item: NewsItem) -> None:
+    h = compute_hash(item.title, item.link)
+    try:
+        await conn.execute(
+            INSERT_ITEM_SQL,
+            (h, item.title, item.link, datetime.utcnow().isoformat()),
+        )
+        await conn.commit()
+    except aiosqlite.IntegrityError:
+        # Hash already exists
+        logger.debug("Item already stored (hash collision/duplicate): %s", item.title)
+    except Exception as e:
+        logger.exception("Error storing item: %s", e)
 
-    def pull(urls):
-        out = []
-        for url in urls:
-            d = feedparser.parse(url)
-            src = d.feed.get("title", "RSS")
-            for e in d.entries[:20]:
-                title = (e.get("title") or "").strip()
-                link  = (e.get("link") or "").strip()
-                summary = extract_summary(e)
-                out.append((src, title, link, summary))
-        return out
 
-    items += pull(BREAKING_FEEDS)
-    items += pull(MACRO_FEEDS)
-    items += pull(SPORTS_FEEDS)
+# =========================
+# Classification
+# =========================
+
+MACRO_KEYWORDS = [
+    "inflation",
+    "cpi",
+    "ppi",
+    "gdp",
+    "recession",
+    "interest rate",
+    "interest rates",
+    "central bank",
+    "bank of england",
+    "boe",
+    "monetary policy",
+    "quantitative easing",
+    "quantitative tightening",
+    "bond yields",
+    "yields",
+    "gilts",
+    "unemployment",
+    "wages",
+    "labour market",
+    "labor market",
+    "sterling",
+    "gbp",
+    "pound",
+]
+
+SPORTS_KEYWORDS = [
+    "football",
+    "premier league",
+    "championship",
+    "fa cup",
+    "carabao cup",
+    "goal",
+    "goals",
+    "match",
+    "fixture",
+    "injury",
+    "injuries",
+    "transfer",
+    "transfers",
+    "manager",
+    "coach",
+    "striker",
+    "midfielder",
+    "defender",
+    "goalkeeper",
+    "club",
+    "team",
+]
+
+POLITICS_KEYWORDS = [
+    "prime minister",
+    "pm",
+    "downing street",
+    "parliament",
+    "mp",
+    "mps",
+    "labour",
+    "labour party",
+    "conservative",
+    "conservatives",
+    "tory",
+    "tories",
+    "lib dem",
+    "liberal democrat",
+    "snp",
+    "green party",
+    "election",
+    "by-election",
+    "referendum",
+    "government",
+    "minister",
+    "cabinet",
+    "home office",
+    "foreign office",
+    "no 10",
+    "no. 10",
+]
+
+CELEBRITY_KEYWORDS = [
+    "celebrity",
+    "royal",
+    "royals",
+    "prince",
+    "princess",
+    "duke",
+    "duchess",
+    "king",
+    "queen",
+    "actor",
+    "actress",
+    "singer",
+    "musician",
+    "tv star",
+    "reality star",
+]
+
+
+class Category:
+    BREAKING = "BREAKING"
+    MACRO = "MACRO"
+    SPORTS = "SPORTS"
+
+
+def classify_news(item: NewsItem) -> Category:
+    text = f"{item.title} {item.source}".lower()
+
+    def contains_any(keywords: List[str]) -> bool:
+        return any(k in text for k in keywords)
+
+    is_sports = contains_any(SPORTS_KEYWORDS)
+    is_macro = contains_any(MACRO_KEYWORDS)
+    is_politics = contains_any(POLITICS_KEYWORDS)
+    is_celebrity = contains_any(CELEBRITY_KEYWORDS)
+
+    # Sports has priority if clearly sports-related
+    if is_sports:
+        return Category.SPORTS
+
+    # Macro only if macro signals and not politics/celebrity
+    if is_macro and not (is_politics or is_celebrity):
+        return Category.MACRO
+
+    # Default: Breaking
+    return Category.BREAKING
+
+
+def category_to_header_and_chat_id(category: Category) -> Tuple[str, int]:
+    if category == Category.BREAKING:
+        return "🇬🇧 BREAKING", BREAKING_CHAT_ID
+    if category == Category.MACRO:
+        return "📊 MACRO", MACRO_CHAT_ID
+    if category == Category.SPORTS:
+        return "⚽ SPORTS", SPORTS_CHAT_ID
+    return "🇬🇧 BREAKING", BREAKING_CHAT_ID
+
+
+# =========================
+# Message formatting
+# =========================
+
+def build_message(item: NewsItem, category: Category) -> str:
+    header, _ = category_to_header_and_chat_id(category)
+    title_upper = item.title.upper().strip()
+
+    # Very lightweight, generic insights—these can be refined later
+    insights = []
+
+    if category == Category.MACRO:
+        insights.append("Signals potential shifts in the UK economic outlook.")
+        insights.append("May influence markets, business planning, or household finances.")
+        insights.append("Relevant for policymakers, investors, and UK consumers.")
+    elif category == Category.SPORTS:
+        insights.append("Reflects momentum and narrative in UK sport.")
+        insights.append("May affect team morale, fan sentiment, or league dynamics.")
+        insights.append("Relevant for clubs, broadcasters, and supporters.")
+    else:  # BREAKING
+        insights.append("Highlights a significant development affecting the UK.")
+        insights.append("May shape public debate, policy, or daily life.")
+        insights.append("Important for understanding the broader UK context.")
+
+    # Ensure exactly 3 insights
+    insights = insights[:3]
+
+    insights_block = "\n".join(f"• {i}" for i in insights)
+
+    # Source name
+    source_name = item.source.strip() or "Unknown"
+
+    # Hashtags: always #Category #UK
+    hashtag = f"#{category.capitalize()}"
+    message = (
+        f"{header}\n\n"
+        f"{title_upper}\n\n"
+        f"Why it matters:\n"
+        f"{insights_block}\n\n"
+        f"Source: {source_name}\n\n"
+        f"{hashtag} #UK"
+    )
+    return message
+
+
+# =========================
+# RSS fetching
+# =========================
+
+async def fetch_rss_feed(session: aiohttp.ClientSession, url: str) -> List[NewsItem]:
+    items: List[NewsItem] = []
+    try:
+        async with session.get(url, timeout=20) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+    except Exception as e:
+        logger.warning("Failed to fetch RSS feed %s: %s", url, e)
+        return items
+
+    # Minimal RSS parsing without external feedparser dependency
+    # We’ll use a very simple regex-free approach based on tags.
+    # For production, you might prefer `feedparser`, but this keeps dependencies lean.
+    from xml.etree import ElementTree as ET
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        logger.warning("Failed to parse RSS feed %s: %s", url, e)
+        return items
+
+    channel = root.find("channel")
+    if channel is None:
+        # Some feeds use namespaces; try a generic approach
+        channel = root
+
+    for item in channel.findall("item"):
+        title_el = item.find("title")
+        link_el = item.find("link")
+        pub_el = item.find("pubDate")
+
+        if title_el is None or link_el is None:
+            continue
+
+        title = title_el.text or ""
+        link = link_el.text or ""
+        pub_date_raw = pub_el.text if pub_el is not None else None
+
+        published = None
+        if pub_date_raw:
+            try:
+                # Many RSS feeds use RFC822-like dates
+                from email.utils import parsedate_to_datetime
+
+                published = parsedate_to_datetime(pub_date_raw)
+            except Exception:
+                published = None
+
+        # Source name from channel title if available
+        source_el = channel.find("title")
+        source_name = source_el.text if source_el is not None else url
+
+        items.append(
+            NewsItem(
+                title=title.strip(),
+                link=link.strip(),
+                source=source_name.strip(),
+                published=published,
+            )
+        )
 
     return items
 
 
-# ---------------- MAIN LOOP ----------------
-async def main():
-    db_init()
-    print("UKNews bot started… (clean style, event dedup enabled)")
+async def fetch_all_feeds() -> List[NewsItem]:
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss_feed(session, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    all_items: List[NewsItem] = []
+    for res in results:
+        if isinstance(res, Exception):
+            logger.warning("Error in feed fetch task: %s", res)
+            continue
+        all_items.extend(res)
+
+    # Deduplicate within this batch by (title, link) to avoid immediate duplicates
+    seen = set()
+    unique_items: List[NewsItem] = []
+    for item in all_items:
+        key = (item.title, item.link)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_items.append(item)
+
+    return unique_items
+
+
+# =========================
+# Telegram sending
+# =========================
+
+async def send_message_with_retry(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    min_delay_seconds: float = 2.0,
+) -> None:
+    """Send a message with basic rate limiting and retry logic."""
+    await asyncio.sleep(min_delay_seconds)
     while True:
-        db_events_cleanup()
-        recent_norms = db_recent_norms(RECENT_LIMIT)
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+            break
+        except RetryAfter as e:
+            delay = getattr(e, "retry_after", 5)
+            logger.warning("RetryAfter from Telegram, sleeping for %s seconds", delay)
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError) as e:
+            logger.warning("Network/timeout error sending message: %s; retrying in 5s", e)
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.exception("Unexpected error sending message: %s", e)
+            break
 
-        for source, title, link, summary in fetch_items():
-            if not title:
-                continue
 
-            k = make_key(title, link)
-            norm = normalize(f"{title} {summary}")
+# =========================
+# Main worker loop
+# =========================
 
-            # hard dedup
-            if db_has_key(k):
-                continue
+async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
+    logger.info("Fetching RSS feeds...")
+    items = await fetch_all_feeds()
+    logger.info("Fetched %d items from feeds", len(items))
 
-            # soft dedup (similar to recent)
-            if any(fuzz.token_set_ratio(norm, rn) >= SIM_THRESHOLD for rn in recent_norms):
-                db_insert_posted(k, norm)
-                continue
+    # Sort by published time if available, else keep order
+    items.sort(key=lambda x: x.published or datetime.utcnow())
 
-            # event-level dedup (story family)
-            ek = make_event_key(title)
-            if db_event_seen_recent(ek):
-                db_insert_posted(k, norm)
-                continue
+    for item in items:
+        if not item.title or not item.link:
+            continue
 
-            ch = classify(source, title, summary)
-            msg = format_post(ch, title, source, summary)
+        # Deduplication
+        if await is_duplicate(conn, item):
+            continue
 
-            await send(ch, msg)
+        # Classification
+        category = classify_news(item)
+        header, chat_id = category_to_header_and_chat_id(category)
 
-            db_insert_posted(k, norm)
-            db_event_touch(ek)
+        if chat_id == 0:
+            logger.warning(
+                "Chat ID for category %s is not configured; skipping item: %s",
+                category,
+                item.title,
+            )
+            continue
 
-            # small throttle to avoid Telegram flood control
-            await asyncio.sleep(2)
+        # Build and send message
+        msg = build_message(item, category)
+        logger.info("Posting to %s: %s", header, item.title)
+        await send_message_with_retry(bot, chat_id, msg)
 
-        await asyncio.sleep(POLL_SECONDS)
+        # Store in DB after successful send attempt (even if send ultimately failed,
+        # we still want to avoid reposting the same headline repeatedly)
+        await store_item(conn, item)
+
+
+async def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
+        return
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    conn = await init_db(DB_PATH)
+
+    stop_event = asyncio.Event()
+
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, shutting down gracefully...", sig)
+        stop_event.set()
+
+    # Handle termination signals for long-lived worker
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    logger.info("UK News Telegram bot started. Poll interval: %s seconds", POLL_SECONDS)
+
+    try:
+        while not stop_event.is_set():
+            try:
+                await process_news_cycle(bot, conn)
+            except Exception as e:
+                logger.exception("Error in processing cycle: %s", e)
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
+            except asyncio.TimeoutError:
+                # Normal wake-up for next cycle
+                pass
+    finally:
+        await conn.close()
+        logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":
