@@ -139,8 +139,15 @@ def format_msg(channel: str, headline: str, source: str) -> str:
         f"{tag1} {tag2}",
     ])
 
-def send(channel: str, text: str):
-    bot.send_message(chat_id=CHANNEL_CHAT_ID[channel], text=text, disable_web_page_preview=True)
+import asyncio
+
+async def send_async(channel: str, text: str):
+    await bot.send_message(
+        chat_id=CHANNEL_CHAT_ID[channel],
+        text=text,
+        disable_web_page_preview=True
+    )
+
 
 def fetch_feeds():
     items = []
@@ -169,7 +176,8 @@ while True:
         norm = normalize(title)
         if is_duplicate(norm):
             continue
-        send(ch, format_msg(ch, title, source))
+        asyncio.run(send_async(ch, format_msg(ch, title, source)))
+
         posted.append({"key": story_key(norm), "norm": norm, "at": now_utc()})
     time.sleep(POLL_SECONDS)
 
