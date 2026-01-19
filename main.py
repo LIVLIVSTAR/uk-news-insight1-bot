@@ -1,6 +1,5 @@
 import os
 import re
-import time
 import hashlib
 import sqlite3
 import asyncio
@@ -21,9 +20,22 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
-POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "600"))   # 10 min default
-SIM_THRESHOLD = int(os.getenv("SIM_THRESHOLD", "92"))   # stronger dedup (0-100)
-RECENT_LIMIT  = int(os.getenv("RECENT_LIMIT", "500"))   # norms kept for soft-dedup
+POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "600"))   # 10 min
+SIM_THRESHOLD = int(os.getenv("SIM_THRESHOLD", "92"))
+RECENT_LIMIT  = int(os.getenv("RECENT_LIMIT", "500"))
+
+# keep ONLY 2 hashtags at the end of each post (your network standard)
+CHANNEL_HASHTAGS = {
+    "breaking": ("#Breaking", "#UK"),
+    "macro":    ("#Macro", "#UK"),
+    "sports":   ("#Sports", "#UK"),
+}
+
+CHANNEL_CHAT_ID = {
+    "breaking": BREAKING_CHAT_ID,
+    "macro":    MACRO_CHAT_ID,
+    "sports":   SPORTS_CHAT_ID,
+}
 
 bot = Bot(token=BOT_TOKEN)
 
@@ -45,18 +57,6 @@ SPORTS_FEEDS = [
     "https://feeds.bbci.co.uk/sport/rss.xml",
 ]
 
-CHANNEL_CHAT_ID = {
-    "breaking": BREAKING_CHAT_ID,
-    "macro": MACRO_CHAT_ID,
-    "sports": SPORTS_CHAT_ID,
-}
-
-# MUST BE ONLY 2 hashtags at end
-CHANNEL_HASHTAGS = {
-    "breaking": ("#Breaking", "#UK"),
-    "macro": ("#Macro", "#UK"),
-    "sports": ("#Sports", "#UK"),
-}
 
 # ---------------- DB (persistent dedup) ----------------
 DB_PATH = "state.db"
@@ -112,229 +112,162 @@ def make_key(title: str, link: str) -> str:
     base = (normalize(title) + "|" + (link or "")).encode("utf-8")
     return hashlib.sha256(base).hexdigest()
 
-def clean_summary(summary: str) -> str:
-    # RSS summaries sometimes contain HTML
-    s = summary or ""
+def clean_html(text: str) -> str:
+    s = text or ""
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def extract_text_payload(title: str, summary: str) -> str:
-    return (title or "") + " " + (summary or "")
+def is_uk_related(n: str) -> bool:
+    return any(x in n for x in [
+        "uk", "britain", "british", "england", "scotland", "wales", "northern ireland",
+        "london", "westminster", "downing street", "parliament", "bank of england", "boe"
+    ])
 
-def detect_signals(n: str):
-    """
-    Returns list of signal tokens derived from the headline/summary text.
-    These signals drive classification + impact reasoning.
-    """
-    signals = []
+def extract_summary(entry) -> str:
+    return clean_html(
+        entry.get("summary")
+        or entry.get("description")
+        or entry.get("subtitle")
+        or ""
+    )
 
-    # Macro / economy
-    if any(x in n for x in ["inflation", "cpi", "ppi", "price index"]):
-        signals.append("inflation")
-    if any(x in n for x in ["gdp", "growth", "recession", "output"]):
-        signals.append("growth")
-    if any(x in n for x in ["interest rate", "rates", "rate cut", "rate hike", "bank of england", "boe"]):
-        signals.append("rates")
-    if any(x in n for x in ["unemployment", "jobs", "wages", "pay"]):
-        signals.append("jobs")
+# ---- KEYWORD SETS (strict macro; broad breaking) ----
+SPORTS_KW = [
+    "premier league", "football", "match", "goal", "injury", "transfer",
+    "manager", "coach", "champions league", "fa cup", "rugby", "cricket", "tennis"
+]
 
-    # Markets / trade
-    if any(x in n for x in ["tariff", "sanction", "trade", "export", "import", "customs duty"]):
-        signals.append("trade_policy")
-    if any(x in n for x in ["bond", "yield", "gilt", "treasury", "spread"]):
-        signals.append("rates_market")
-    if any(x in n for x in ["gbp", "pound", "sterling"]):
-        signals.append("fx_gbp")
+MACRO_KW = [
+    "inflation", "cpi", "ppi", "gdp", "interest rate", "rates", "rate cut", "rate hike",
+    "bank of england", "boe", "unemployment", "wages", "pay growth", "recession",
+    "bond", "yield", "gilt", "sterling", "gbp", "budget", "tax", "tariff", "sanction"
+]
 
-    # Geopolitics / security
-    if any(x in n for x in ["nato", "eu leaders", "european leaders", "white house", "downing street", "kremlin"]):
-        signals.append("diplomacy")
-    if any(x in n for x in ["war", "conflict", "attack", "missile", "drone", "troops"]):
-        signals.append("security")
-    if any(x in n for x in ["unacceptable", "condemn", "warning", "threat", "retaliat"]):
-        signals.append("escalation_language")
+# optional: tickers/hashtags like #COIN #CRCL (can be switched off)
+ENABLE_TICKER_TAGS = os.getenv("ENABLE_TICKER_TAGS", "1") == "1"
 
-    # Legal / regulator / investigations
-    if any(x in n for x in ["accused", "investigation", "probe", "watchdog", "regulator", "court", "lawsuit", "charged"]):
-        signals.append("investigation")
-
-    # Consumer / business
-    if any(x in n for x in ["restaurant", "delivery apps", "uber eats", "deliveroo", "just eat"]):
-        signals.append("consumer_delivery")
-    if any(x in n for x in ["big chains", "supermarket", "retailer", "brand"]):
-        signals.append("consumer_retail")
-
-    # Sports
-    if any(x in n for x in ["premier league", "football", "match", "goal", "manager", "coach", "transfer", "injury"]):
-        signals.append("sports")
-
-    # Keep unique, stable order
-    seen = set()
+def extract_ticker_tags(title: str):
+    if not ENABLE_TICKER_TAGS:
+        return []
+    # crude but useful: ALLCAPS tokens 2-6 chars, avoid common words
+    bad = {"UK", "US", "EU", "NATO", "BBC", "ONS", "PM", "MP"}
+    tokens = re.findall(r"\b[A-Z]{2,6}\b", title or "")
     out = []
-    for s in signals:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    for t in tokens:
+        if t not in bad and t not in out:
+            out.append(t)
+    return out[:2]  # max 2 ticker tags
+
 
 def classify(source: str, title: str, summary: str) -> str:
-    n = normalize(extract_text_payload(title, summary))
+    """
+    STRICT:
+      - sports if sports keywords hit
+      - macro only if macro keywords hit
+      - else breaking
+    """
+    n = normalize(f"{title} {summary}")
     s = (source or "").lower()
-    sig = detect_signals(n)
 
-    # sports first (signal or source name)
-    if "sport" in s or "sports" in s or ("sports" in sig):
+    if "sport" in s or any(k in n for k in SPORTS_KW):
         return "sports"
 
-    # macro if macro signals exist
-    if any(x in sig for x in ["inflation", "growth", "rates", "jobs", "rates_market", "fx_gbp"]):
+    if any(k in n for k in MACRO_KW):
         return "macro"
 
     return "breaking"
 
-def build_insight_impact(channel: str, title: str, summary: str):
+
+def topic_tags(channel: str, title: str, summary: str):
     """
-    Returns (insight_line, impacts_list, signals_list)
+    Internal tags for header line (not the final 2 hashtags).
+    Keep short; mimic MarketTwits vibe.
     """
-    n = normalize(extract_text_payload(title, summary))
-    sig = detect_signals(n)
+    n = normalize(f"{title} {summary}")
+    tags = []
 
-    # Default (safe)
-    insight = "Developing story — details may evolve as updates come in."
-    impacts = [
-        "Watch for official statements / confirmations",
-        "Follow-up headlines may add clarity",
-        "Second-order impacts depend on next actions"
-    ]
+    # geography / context
+    if is_uk_related(n):
+        tags.append("британия")
+    else:
+        tags.append("world")
 
-    if channel == "sports":
-        insight = "Sports update — impact depends on availability, selection, and fixtures."
-        impacts = [
-            "Lineups / squad choices may shift",
-            "Momentum & upcoming fixtures affected",
-            "Follow-up updates likely (fitness, transfers, team news)"
-        ]
-        if "injury" in n:
-            insight = "Injury-related update — availability may change short-term plans."
-        if "transfer" in n:
-            insight = "Transfer-related update — squad strength and tactics may shift."
-        return insight, impacts, sig
+    # topic buckets
+    if any(x in n for x in ["tariff", "sanction", "trade war", "trade"]):
+        tags.append("торговыевойны")
+    if any(x in n for x in ["trump", "biden", "eu", "nato", "russia", "china", "iran", "ukraine", "zelensky"]):
+        tags.append("геополитика")
+    if any(x in n for x in ["stocks", "shares", "equities", "bonds", "yield", "gilt"]):
+        tags.append("акции")
+    if any(x in n for x in ["crypto", "bitcoin", "ethereum", "coinbase", "circle", "stablecoin", "blockchain"]):
+        tags.append("крипто")
+    if any(x in n for x in ["inflation", "cpi", "ppi", "gdp", "recession", "rates", "bank of england", "boe"]):
+        tags.append("экономика")
+    if any(x in n for x in ["attack", "war", "missile", "bomb", "shooting", "abduct", "kidnap", "terror"]):
+        tags.append("security")
 
-    if channel == "macro":
-        insight = "Macro headline — market reaction is driven by expectations vs actual outcomes."
-        impacts = [
-            "Rate expectations can move quickly",
-            "GBP and yields may react to surprises",
-            "Risk sentiment can shift across UK assets"
-        ]
+    if channel == "sports" and "спорт" not in tags:
+        tags.append("спорт")
 
-        if "inflation" in sig:
-            insight = "Inflation signal — pricing pressure can change the rate path narrative."
-            impacts = [
-                "BoE rate-cut timing may shift",
-                "GBP volatility can pick up",
-                "Mortgage / borrowing costs may reprice"
-            ]
-        elif "growth" in sig:
-            insight = "Growth signal — recession risk vs resilience can reprice risk appetite."
-            impacts = [
-                "Equities may reprice growth expectations",
-                "Cyclicals/defensives rotation risk",
-                "Consumer demand outlook may shift"
-            ]
-        elif "jobs" in sig:
-            insight = "Jobs signal — wage pressure and slack affect inflation outlook."
-            impacts = [
-                "Rate path expectations may adjust",
-                "GBP reaction possible",
-                "Policy commentary risk increases"
-            ]
-        elif "fx_gbp" in sig:
-            insight = "GBP signal — currency moves can amplify domestic inflation/financial conditions."
-            impacts = [
-                "FX-driven volatility risk",
-                "Imported inflation narrative may shift",
-                "Risk-on/risk-off positioning can change"
-            ]
+    # keep unique, max 4
+    uniq = []
+    for t in tags:
+        if t not in uniq:
+            uniq.append(t)
+    return uniq[:4]
 
-        return insight, impacts, sig
 
-    # breaking
-    insight = "Breaking headline — impact depends on policy response and escalation dynamics."
-    impacts = [
-        "Fast follow-ups likely as officials respond",
-        "Policy/regulatory steps can change direction quickly",
-        "Knock-on impacts possible across markets and public sentiment"
-    ]
+def header_line(channel: str, title: str, summary: str):
+    """
+    Example like screenshot:
+    ⚠️ 🇬🇧 #экономика #британия
+    """
+    icon = {"breaking": "❗", "macro": "⚠️", "sports": "⚽"}.get(channel, "❗")
+    n = normalize(f"{title} {summary}")
+    flag = "🇬🇧" if is_uk_related(n) else "🌍"
 
-    if "trade_policy" in sig:
-        insight = "Trade policy signal — tariffs/sanctions can change pricing and retaliation risk."
-        impacts = [
-            "Trade flows & prices may shift",
-            "Retaliation / escalation risk rises",
-            "Markets may reprice policy uncertainty"
-        ]
+    tags = topic_tags(channel, title, summary)
+    # header tags are in Russian like your screenshot
+    tag_str = " ".join(f"#{t}" for t in tags)
+    return f"{icon} {flag} {tag_str}".strip()
 
-    if "investigation" in sig:
-        insight = "Investigation/regulator signal — credibility and compliance questions can escalate."
-        impacts = [
-            "Regulatory scrutiny may increase",
-            "Consumer trust implications",
-            "Business operations/pricing could be affected"
-        ]
 
-    if "diplomacy" in sig or "security" in sig or "escalation_language" in sig:
-        insight = "Geopolitical signal — rhetoric and reactions can raise headline risk premium."
-        impacts = [
-            "Diplomatic escalation risk",
-            "Policy response / statements likely",
-            "Follow-up headlines can move sentiment fast"
-        ]
-
-    if "consumer_delivery" in sig or "consumer_retail" in sig:
-        insight = "Consumer/business signal — brand positioning and transparency can face scrutiny."
-        impacts = [
-            "Consumer trust & pricing impact possible",
-            "Regulatory/industry response may follow",
-            "Competitors may change tactics quickly"
-        ]
-
-    return insight, impacts, sig
-
-def format_msg(channel: str, headline: str, summary: str, source: str) -> str:
+def format_post(channel: str, title: str, source: str, summary: str):
+    """
+    MarketTwits style:
+    Header line (icon + flag + a few topic tags)
+    One-liner (title — source)
+    Optional: 1 short context line if summary is clearly useful
+    End: EXACTLY 2 network hashtags
+    """
     tag1, tag2 = CHANNEL_HASHTAGS[channel]
-    header = "🇬🇧 BREAKING" if channel == "breaking" else ("📊 MACRO" if channel == "macro" else "⚽ SPORTS")
 
-    insight, impacts, sig = build_insight_impact(channel, headline, summary)
+    t = (title or "").strip()
+    s = (source or "RSS").strip()
 
-    # Keep summary short (optional line)
-    summary_clean = clean_summary(summary)
-    summary_line = ""
-    if summary_clean:
-        # limit length to avoid walls of text
-        if len(summary_clean) > 180:
-            summary_clean = summary_clean[:177].rstrip() + "…"
-        summary_line = f"\nContext: {summary_clean}\n"
+    # optional context: only if summary adds real info and isn't junk
+    ctx = clean_html(summary)
+    ctx_line = ""
+    if ctx:
+        # keep it very short
+        if len(ctx) > 140:
+            ctx = ctx[:137].rstrip() + "…"
+        # avoid repeating title words too much (simple check)
+        if fuzz.partial_ratio(normalize(ctx), normalize(t)) < 85:
+            ctx_line = f"\n{ctx}"
 
-    signals_line = ""
-    if sig:
-        signals_line = f"\nSignals detected: {', '.join(sig[:6])}\n"
+    tickers = extract_ticker_tags(t)
+    ticker_line = ""
+    if tickers:
+        ticker_line = "\n" + " ".join(f"#{x}" for x in tickers)
 
     return "\n".join([
-        header,
+        header_line(channel, t, summary),
         "",
-        headline.strip(),
-        summary_line.strip(),
-        "Insight:",
-        f"• {insight}",
-        signals_line.strip(),
-        "Impact (why it matters):",
-        f"• {impacts[0]}",
-        f"• {impacts[1]}",
-        f"• {impacts[2]}",
-        "",
-        f"Source: {source}",
+        f"{t} — {s}",
+        ctx_line.strip(),
+        ticker_line.strip(),
         "",
         f"{tag1} {tag2}",
     ]).replace("\n\n\n", "\n\n").strip()
@@ -374,16 +307,7 @@ def fetch_items():
             for e in d.entries[:15]:
                 title = (e.get("title") or "").strip()
                 link  = (e.get("link") or "").strip()
-
-                # RSS usually has one of these; not always
-                summary = (
-                    e.get("summary")
-                    or e.get("description")
-                    or e.get("subtitle")
-                    or ""
-                )
-                summary = clean_summary(summary)
-
+                summary = extract_summary(e)
                 out.append((src, title, link, summary))
         return out
 
@@ -397,7 +321,7 @@ def fetch_items():
 # ---------------- MAIN LOOP ----------------
 async def main():
     db_init()
-    print("UKNewsInsight_Bot started…")
+    print("UKNews_MT_Style bot started…")
 
     while True:
         recent_norms = db_recent_norms(RECENT_LIMIT)
@@ -407,26 +331,25 @@ async def main():
                 continue
 
             k = make_key(title, link)
+            norm = normalize(f"{title} {summary}")
 
-            payload = extract_text_payload(title, summary)
-            norm = normalize(payload)
-
-            # hard dedup: already posted
+            # hard dedup
             if db_has_key(k):
                 continue
 
-            # soft dedup: similar to recent headlines/summaries
+            # soft dedup (similar to last N items)
             if any(fuzz.token_set_ratio(norm, rn) >= SIM_THRESHOLD for rn in recent_norms):
-                db_insert(k, norm)  # mark as seen to avoid future repeats
+                db_insert(k, norm)  # mark as seen
                 continue
 
             ch = classify(source, title, summary)
 
-            msg = format_msg(ch, title, summary, source)
+            msg = format_post(ch, title, source, summary)
             await send(ch, msg)
+
             db_insert(k, norm)
 
-            # small throttle to avoid flood control
+            # small throttle
             await asyncio.sleep(2)
 
         await asyncio.sleep(POLL_SECONDS)
