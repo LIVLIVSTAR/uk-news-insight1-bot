@@ -193,6 +193,17 @@ def category_to_header_and_chat_id(category: Category) -> Tuple[str, int]:
 def build_message(item: NewsItem, category: Category) -> str:
     emoji, _ = category_to_header_and_chat_id(category)
     title = item.title.strip()
+    source = item.source.strip().lower() or "unknown"
+    hashtags = f"#{category.lower()} #uk"
+
+    return (
+        f"{emoji} {hashtags}\n"
+        f"{title}\n\n"
+        f"{source}"
+    )
+def build_message(item: NewsItem, category: Category) -> str:
+    emoji, _ = category_to_header_and_chat_id(category)
+    title = item.title.strip()
     source = item.source.strip() or "Unknown"
     hashtags = f"#{category.lower()} #uk"
 
