@@ -54,7 +54,7 @@ class NewsItem:
 
 
 # =========================
-# DATABASE
+# DATABASE & DEDUP
 # =========================
 
 CREATE_TABLE_SQL = """
@@ -97,12 +97,14 @@ def compute_hash(title: str, link: str) -> str:
 async def is_duplicate(conn: aiosqlite.Connection, item: NewsItem) -> bool:
     h = compute_hash(item.title, item.link)
 
+    # Exact hash
     cursor = await conn.execute("SELECT 1 FROM news_items WHERE hash = ?;", (h,))
     row = await cursor.fetchone()
     await cursor.close()
     if row:
         return True
 
+    # Fuzzy similarity on recent titles
     cutoff = datetime.utcnow() - timedelta(minutes=FUZZY_LOOKBACK_MINUTES)
     cursor = await conn.execute(SELECT_RECENT_TITLES_SQL, (cutoff.isoformat(),))
     rows = await cursor.fetchall()
@@ -126,6 +128,7 @@ async def store_item(conn: aiosqlite.Connection, item: NewsItem) -> None:
         )
         await conn.commit()
     except Exception:
+        # Already stored or other non-fatal DB issue
         pass
 
 
@@ -137,22 +140,26 @@ MACRO_KEYWORDS = [
     "inflation", "cpi", "ppi", "gdp", "recession",
     "interest rate", "interest rates", "bank of england", "boe",
     "bond yields", "gilts", "unemployment", "wages", "labour market",
-    "sterling", "gbp", "pound",
+    "labor market", "sterling", "gbp", "pound",
 ]
 
 SPORTS_KEYWORDS = [
-    "football", "premier league", "goal", "match", "fixture",
-    "injury", "transfer", "manager", "coach", "team", "club",
+    "football", "premier league", "championship", "fa cup", "carabao cup",
+    "goal", "goals", "match", "fixture", "injury", "injuries",
+    "transfer", "transfers", "manager", "coach", "team", "club",
 ]
 
 POLITICS_KEYWORDS = [
-    "prime minister", "pm", "parliament", "mp", "mps",
-    "labour", "conservative", "tory", "election", "government",
+    "prime minister", "pm", "downing street", "parliament", "mp", "mps",
+    "labour", "labour party", "conservative", "conservatives", "tory",
+    "tories", "election", "by-election", "referendum", "government",
+    "minister", "cabinet", "home office", "foreign office",
 ]
 
 CELEBRITY_KEYWORDS = [
-    "royal", "prince", "princess", "king", "queen",
-    "actor", "singer", "celebrity",
+    "celebrity", "royal", "royals", "prince", "princess", "duke",
+    "duchess", "king", "queen", "actor", "actress", "singer",
+    "musician", "tv star", "reality star",
 ]
 
 
@@ -165,35 +172,39 @@ class Category:
 def classify_news(item: NewsItem) -> Category:
     text = f"{item.title} {item.source}".lower()
 
-    def has(words): return any(w in text for w in words)
+    def has(words: List[str]) -> bool:
+        return any(w in text for w in words)
 
+    # Sports first
     if has(SPORTS_KEYWORDS):
         return Category.SPORTS
 
+    # Macro only if macro and not politics/celebrity
     if has(MACRO_KEYWORDS) and not (has(POLITICS_KEYWORDS) or has(CELEBRITY_KEYWORDS)):
         return Category.MACRO
 
+    # Default: breaking
     return Category.BREAKING
 
 
 def category_to_header_and_chat_id(category: Category) -> Tuple[str, int]:
     if category == Category.BREAKING:
-        return "🇬🇧 BREAKING", BREAKING_CHAT_ID
+        return "🇬🇧", BREAKING_CHAT_ID
     if category == Category.MACRO:
-        return "📊 MACRO", MACRO_CHAT_ID
+        return "📊", MACRO_CHAT_ID
     if category == Category.SPORTS:
-        return "⚽ SPORTS", SPORTS_CHAT_ID
-    return "🇬🇧 BREAKING", BREAKING_CHAT_ID
+        return "⚽", SPORTS_CHAT_ID
+    return "🇬🇧", BREAKING_CHAT_ID
 
 
 # =========================
-# MESSAGE FORMAT (NO WHY IT MATTERS)
+# MESSAGE FORMAT (MARKETTWITS STYLE)
 # =========================
 
 def build_message(item: NewsItem, category: Category) -> str:
     emoji, _ = category_to_header_and_chat_id(category)
     title = item.title.strip()
-    source = item.source.strip().lower() or "unknown"
+    source = (item.source or "").strip().lower() or "unknown"
     hashtags = f"#{category.lower()} #uk"
 
     return (
@@ -201,19 +212,6 @@ def build_message(item: NewsItem, category: Category) -> str:
         f"{title}\n\n"
         f"{source}"
     )
-def build_message(item: NewsItem, category: Category) -> str:
-    emoji, _ = category_to_header_and_chat_id(category)
-    title = item.title.strip()
-    source = item.source.strip() or "Unknown"
-    hashtags = f"#{category.lower()} #uk"
-
-    return (
-        f"{emoji} {hashtags}\n"
-        f"{title}\n\n"
-        f"{source.lower()}"
-    )
-
-
 
 
 # =========================
@@ -221,42 +219,48 @@ def build_message(item: NewsItem, category: Category) -> str:
 # =========================
 
 async def fetch_rss_feed(session: aiohttp.ClientSession, url: str) -> List[NewsItem]:
-    items = []
+    items: List[NewsItem] = []
     try:
         async with session.get(url, timeout=20) as resp:
+            resp.raise_for_status()
             text = await resp.text()
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch RSS feed %s: %s", url, e)
         return items
 
     from xml.etree import ElementTree as ET
+
     try:
         root = ET.fromstring(text)
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to parse RSS feed %s: %s", url, e)
         return items
 
-    channel = root.find("channel") or root
+    channel = root.find("channel")
+    if channel is None:
+        channel = root
 
     for item in channel.findall("item"):
         title_el = item.find("title")
         link_el = item.find("link")
         pub_el = item.find("pubDate")
 
-        if not title_el or not link_el:
+        if title_el is None or link_el is None:
             continue
 
         title = title_el.text or ""
         link = link_el.text or ""
 
-        published = None
-        if pub_el is not None:
+        published: Optional[datetime] = None
+        if pub_el is not None and pub_el.text:
             try:
                 from email.utils import parsedate_to_datetime
                 published = parsedate_to_datetime(pub_el.text)
             except Exception:
-                pass
+                published = None
 
         source_el = channel.find("title")
-        source_name = source_el.text if source_el is not None else url
+        source_name = source_el.text if source_el is not None and source_el.text else url
 
         items.append(
             NewsItem(
@@ -272,23 +276,23 @@ async def fetch_rss_feed(session: aiohttp.ClientSession, url: str) -> List[NewsI
 
 async def fetch_all_feeds() -> List[NewsItem]:
     async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[fetch_rss_feed(session, url) for url in RSS_FEEDS],
-            return_exceptions=True,
-        )
+        tasks = [fetch_rss_feed(session, url) for url in RSS_FEEDS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_items = []
-    for r in results:
-        if isinstance(r, list):
-            all_items.extend(r)
+    all_items: List[NewsItem] = []
+    for res in results:
+        if isinstance(res, list):
+            all_items.extend(res)
 
+    # Dedup within batch
     seen = set()
-    unique = []
+    unique: List[NewsItem] = []
     for item in all_items:
         key = (item.title, item.link)
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
 
     return unique
 
@@ -298,16 +302,21 @@ async def fetch_all_feeds() -> List[NewsItem]:
 # =========================
 
 async def send_message_with_retry(bot: Bot, chat_id: int, text: str) -> None:
+    # basic spacing to avoid flood
     await asyncio.sleep(2)
     while True:
         try:
             await bot.send_message(chat_id=chat_id, text=text)
             break
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-        except (TimedOut, NetworkError):
+            delay = getattr(e, "retry_after", 5)
+            logger.warning("RetryAfter from Telegram, sleeping for %s seconds", delay)
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError) as e:
+            logger.warning("Network/timeout error sending message: %s; retrying in 5s", e)
             await asyncio.sleep(5)
-        except Exception:
+        except Exception as e:
+            logger.exception("Unexpected error sending message: %s", e)
             break
 
 
@@ -315,27 +324,35 @@ async def send_message_with_retry(bot: Bot, chat_id: int, text: str) -> None:
 # MAIN LOOP
 # =========================
 
-async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection):
+async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
+    logger.info("Fetching RSS feeds...")
     items = await fetch_all_feeds()
+    logger.info("Fetched %d items from feeds", len(items))
+
     items.sort(key=lambda x: x.published or datetime.utcnow())
 
     for item in items:
+        if not item.title or not item.link:
+            continue
+
         if await is_duplicate(conn, item):
             continue
 
         category = classify_news(item)
         _, chat_id = category_to_header_and_chat_id(category)
         if chat_id == 0:
+            logger.warning("Chat ID for category %s not configured, skipping", category)
             continue
 
         msg = build_message(item, category)
+        logger.info("Posting [%s] %s", category, item.title)
         await send_message_with_retry(bot, chat_id, msg)
         await store_item(conn, item)
 
 
-async def main():
+async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("Missing TELEGRAM_BOT_TOKEN")
+        logger.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
         return
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -343,24 +360,29 @@ async def main():
 
     stop_event = asyncio.Event()
 
-    def stop(*_):
+    def handle_signal(sig, frame):
+        logger.info("Received signal %s, shutting down...", sig)
         stop_event.set()
 
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-    while not stop_event.is_set():
-        try:
-            await process_news_cycle(bot, conn)
-        except Exception as e:
-            logger.exception("Cycle error: %s", e)
+    logger.info("UK News bot started. Poll interval: %s seconds", POLL_SECONDS)
 
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+    try:
+        while not stop_event.is_set():
+            try:
+                await process_news_cycle(bot, conn)
+            except Exception as e:
+                logger.exception("Error in processing cycle: %s", e)
 
-    await conn.close()
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        await conn.close()
+        logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":
