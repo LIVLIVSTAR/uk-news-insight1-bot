@@ -20,11 +20,12 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
-POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "600"))   # 10 min
-SIM_THRESHOLD = int(os.getenv("SIM_THRESHOLD", "92"))
-RECENT_LIMIT  = int(os.getenv("RECENT_LIMIT", "500"))
+POLL_SECONDS     = int(os.getenv("POLL_SECONDS", "600"))   # 10 min default
+SIM_THRESHOLD    = int(os.getenv("SIM_THRESHOLD", "92"))   # 0..100
+RECENT_LIMIT     = int(os.getenv("RECENT_LIMIT", "600"))   # soft-dedup memory
+EVENT_TTL_HOURS  = int(os.getenv("EVENT_TTL_HOURS", "24")) # event-level dedup window
 
-# keep ONLY 2 hashtags at the end of each post (your network standard)
+# Keep ONLY 2 hashtags at end of each post (network standard)
 CHANNEL_HASHTAGS = {
     "breaking": ("#Breaking", "#UK"),
     "macro":    ("#Macro", "#UK"),
@@ -64,6 +65,8 @@ DB_PATH = "state.db"
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+
+    # hard dedup (title+link)
     cur.execute("""
       CREATE TABLE IF NOT EXISTS posted (
         k TEXT PRIMARY KEY,
@@ -71,6 +74,15 @@ def db_init():
         ts TEXT
       )
     """)
+
+    # event-level dedup (story family)
+    cur.execute("""
+      CREATE TABLE IF NOT EXISTS events (
+        ek TEXT PRIMARY KEY,
+        ts TEXT
+      )
+    """)
+
     con.commit()
     con.close()
 
@@ -82,7 +94,7 @@ def db_has_key(k: str) -> bool:
     con.close()
     return row is not None
 
-def db_insert(k: str, norm: str):
+def db_insert_posted(k: str, norm: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -92,13 +104,43 @@ def db_insert(k: str, norm: str):
     con.commit()
     con.close()
 
-def db_recent_norms(limit: int = 500):
+def db_recent_norms(limit: int = 600):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("SELECT norm FROM posted ORDER BY ts DESC LIMIT ?", (limit,))
     rows = cur.fetchall()
     con.close()
     return [r[0] for r in rows if r and r[0]]
+
+def db_event_seen_recent(ek: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT 1 FROM events
+        WHERE ek = ?
+          AND ts >= datetime('now', ?)
+        LIMIT 1
+    """, (ek, f"-{EVENT_TTL_HOURS} hours"))
+    row = cur.fetchone()
+    con.close()
+    return row is not None
+
+def db_event_touch(ek: str):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO events (ek, ts) VALUES (?, ?)",
+        (ek, datetime.now(timezone.utc).isoformat())
+    )
+    con.commit()
+    con.close()
+
+def db_events_cleanup():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM events WHERE ts < datetime('now', ?)", (f"-{EVENT_TTL_HOURS} hours",))
+    con.commit()
+    con.close()
 
 
 # ---------------- HELPERS ----------------
@@ -118,12 +160,6 @@ def clean_html(text: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def is_uk_related(n: str) -> bool:
-    return any(x in n for x in [
-        "uk", "britain", "british", "england", "scotland", "wales", "northern ireland",
-        "london", "westminster", "downing street", "parliament", "bank of england", "boe"
-    ])
-
 def extract_summary(entry) -> str:
     return clean_html(
         entry.get("summary")
@@ -132,41 +168,19 @@ def extract_summary(entry) -> str:
         or ""
     )
 
-# ---- KEYWORD SETS (strict macro; broad breaking) ----
+# Strict-ish keywords
 SPORTS_KW = [
     "premier league", "football", "match", "goal", "injury", "transfer",
-    "manager", "coach", "champions league", "fa cup", "rugby", "cricket", "tennis"
+    "manager", "coach", "champions league", "fa cup", "rugby", "cricket", "tennis",
 ]
 
 MACRO_KW = [
     "inflation", "cpi", "ppi", "gdp", "interest rate", "rates", "rate cut", "rate hike",
     "bank of england", "boe", "unemployment", "wages", "pay growth", "recession",
-    "bond", "yield", "gilt", "sterling", "gbp", "budget", "tax", "tariff", "sanction"
+    "bond", "yield", "gilt", "sterling", "gbp", "budget", "tax",
 ]
 
-# optional: tickers/hashtags like #COIN #CRCL (can be switched off)
-ENABLE_TICKER_TAGS = os.getenv("ENABLE_TICKER_TAGS", "1") == "1"
-
-def extract_ticker_tags(title: str):
-    if not ENABLE_TICKER_TAGS:
-        return []
-    # crude but useful: ALLCAPS tokens 2-6 chars, avoid common words
-    bad = {"UK", "US", "EU", "NATO", "BBC", "ONS", "PM", "MP"}
-    tokens = re.findall(r"\b[A-Z]{2,6}\b", title or "")
-    out = []
-    for t in tokens:
-        if t not in bad and t not in out:
-            out.append(t)
-    return out[:2]  # max 2 ticker tags
-
-
 def classify(source: str, title: str, summary: str) -> str:
-    """
-    STRICT:
-      - sports if sports keywords hit
-      - macro only if macro keywords hit
-      - else breaking
-    """
     n = normalize(f"{title} {summary}")
     s = (source or "").lower()
 
@@ -179,98 +193,68 @@ def classify(source: str, title: str, summary: str) -> str:
     return "breaking"
 
 
-def topic_tags(channel: str, title: str, summary: str):
+# ---------------- EVENT-LEVEL DEDUP ----------------
+STOPWORDS = {
+    # common news filler words (EN)
+    "watch", "live", "update", "latest", "video", "photos", "explained",
+    "what", "we", "know", "about", "why", "how", "after", "as", "at", "in",
+    "on", "to", "of", "and", "a", "an", "the", "for", "with", "from",
+    "says", "say", "told", "report", "reports", "scene", "new", "more",
+    "than", "least", "near", "city", "worst", "disaster", "decade",
+}
+
+def make_event_key(title: str) -> str:
     """
-    Internal tags for header line (not the final 2 hashtags).
-    Keep short; mimic MarketTwits vibe.
+    Group related headlines about the same story.
+    Designed to suppress BBC-style multi-posts (Watch / What we know / survivors say...)
     """
-    n = normalize(f"{title} {summary}")
-    tags = []
+    t = normalize(title)
 
-    # geography / context
-    if is_uk_related(n):
-        tags.append("британия")
-    else:
-        tags.append("world")
+    # remove common prefix patterns
+    t = re.sub(r"^(watch|live|update)\s*:\s*", "", t).strip()
+    t = re.sub(r"^what we know about\s+", "", t).strip()
 
-    # topic buckets
-    if any(x in n for x in ["tariff", "sanction", "trade war", "trade"]):
-        tags.append("торговыевойны")
-    if any(x in n for x in ["trump", "biden", "eu", "nato", "russia", "china", "iran", "ukraine", "zelensky"]):
-        tags.append("геополитика")
-    if any(x in n for x in ["stocks", "shares", "equities", "bonds", "yield", "gilt"]):
-        tags.append("акции")
-    if any(x in n for x in ["crypto", "bitcoin", "ethereum", "coinbase", "circle", "stablecoin", "blockchain"]):
-        tags.append("крипто")
-    if any(x in n for x in ["inflation", "cpi", "ppi", "gdp", "recession", "rates", "bank of england", "boe"]):
-        tags.append("экономика")
-    if any(x in n for x in ["attack", "war", "missile", "bomb", "shooting", "abduct", "kidnap", "terror"]):
-        tags.append("security")
+    tokens = [x for x in t.split() if len(x) >= 4 and x not in STOPWORDS]
 
-    if channel == "sports" and "спорт" not in tags:
-        tags.append("спорт")
+    # keep strongest tokens only; sort for order-invariance
+    tokens = sorted(set(tokens[:12]))
 
-    # keep unique, max 4
-    uniq = []
-    for t in tags:
-        if t not in uniq:
-            uniq.append(t)
-    return uniq[:4]
+    base = " ".join(tokens)[:140]
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
-def header_line(channel: str, title: str, summary: str):
-    """
-    Example like screenshot:
-    ⚠️ 🇬🇧 #экономика #британия
-    """
-    icon = {"breaking": "❗", "macro": "⚠️", "sports": "⚽"}.get(channel, "❗")
-    n = normalize(f"{title} {summary}")
-    flag = "🇬🇧" if is_uk_related(n) else "🌍"
-
-    tags = topic_tags(channel, title, summary)
-    # header tags are in Russian like your screenshot
-    tag_str = " ".join(f"#{t}" for t in tags)
-    return f"{icon} {flag} {tag_str}".strip()
-
-
-def format_post(channel: str, title: str, source: str, summary: str):
-    """
-    MarketTwits style:
-    Header line (icon + flag + a few topic tags)
-    One-liner (title — source)
-    Optional: 1 short context line if summary is clearly useful
-    End: EXACTLY 2 network hashtags
-    """
+# ---------------- FORMAT (NO EMOJIS / NO EXTRA TAGS) ----------------
+def format_post(channel: str, title: str, source: str, summary: str) -> str:
     tag1, tag2 = CHANNEL_HASHTAGS[channel]
 
     t = (title or "").strip()
     s = (source or "RSS").strip()
 
-    # optional context: only if summary adds real info and isn't junk
     ctx = clean_html(summary)
     ctx_line = ""
     if ctx:
-        # keep it very short
-        if len(ctx) > 140:
-            ctx = ctx[:137].rstrip() + "…"
-        # avoid repeating title words too much (simple check)
+        # keep context short, and only if it adds something different from title
+        if len(ctx) > 180:
+            ctx = ctx[:177].rstrip() + "…"
         if fuzz.partial_ratio(normalize(ctx), normalize(t)) < 85:
-            ctx_line = f"\n{ctx}"
+            ctx_line = ctx
 
-    tickers = extract_ticker_tags(t)
-    ticker_line = ""
-    if tickers:
-        ticker_line = "\n" + " ".join(f"#{x}" for x in tickers)
+    parts = [
+        t,
+        f"— {s}",
+    ]
+    first_line = " ".join(parts).strip()
+
+    if ctx_line:
+        body = first_line + "\n" + ctx_line
+    else:
+        body = first_line
 
     return "\n".join([
-        header_line(channel, t, summary),
-        "",
-        f"{t} — {s}",
-        ctx_line.strip(),
-        ticker_line.strip(),
+        body.strip(),
         "",
         f"{tag1} {tag2}",
-    ]).replace("\n\n\n", "\n\n").strip()
+    ]).strip()
 
 
 # ---------------- TELEGRAM SEND ----------------
@@ -304,7 +288,7 @@ def fetch_items():
         for url in urls:
             d = feedparser.parse(url)
             src = d.feed.get("title", "RSS")
-            for e in d.entries[:15]:
+            for e in d.entries[:20]:
                 title = (e.get("title") or "").strip()
                 link  = (e.get("link") or "").strip()
                 summary = extract_summary(e)
@@ -321,9 +305,10 @@ def fetch_items():
 # ---------------- MAIN LOOP ----------------
 async def main():
     db_init()
-    print("UKNews_MT_Style bot started…")
+    print("UKNews bot started… (clean style, event dedup enabled)")
 
     while True:
+        db_events_cleanup()
         recent_norms = db_recent_norms(RECENT_LIMIT)
 
         for source, title, link, summary in fetch_items():
@@ -337,19 +322,26 @@ async def main():
             if db_has_key(k):
                 continue
 
-            # soft dedup (similar to last N items)
+            # soft dedup (similar to recent)
             if any(fuzz.token_set_ratio(norm, rn) >= SIM_THRESHOLD for rn in recent_norms):
-                db_insert(k, norm)  # mark as seen
+                db_insert_posted(k, norm)
+                continue
+
+            # event-level dedup (story family)
+            ek = make_event_key(title)
+            if db_event_seen_recent(ek):
+                db_insert_posted(k, norm)
                 continue
 
             ch = classify(source, title, summary)
-
             msg = format_post(ch, title, source, summary)
+
             await send(ch, msg)
 
-            db_insert(k, norm)
+            db_insert_posted(k, norm)
+            db_event_touch(ek)
 
-            # small throttle
+            # small throttle to avoid Telegram flood control
             await asyncio.sleep(2)
 
         await asyncio.sleep(POLL_SECONDS)
