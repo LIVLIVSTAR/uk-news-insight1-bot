@@ -1,5 +1,4 @@
 import os
-import time
 import re
 import hashlib
 import sqlite3
@@ -21,8 +20,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
-SIM_THRESHOLD = int(os.getenv("SIM_THRESHOLD", "90"))
+POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "600"))   # safer default
+SIM_THRESHOLD = int(os.getenv("SIM_THRESHOLD", "92"))   # stronger dedup
 
 bot = Bot(token=BOT_TOKEN)
 
@@ -56,8 +55,14 @@ CHANNEL_HASHTAGS = {
     "sports": ("#Sports", "#UK"),
 }
 
-SPORTS_KW = ["goal","injury","transfer","match","premier league","football","coach","manager"]
-MACRO_KW  = ["inflation","cpi","ppi","gdp","rates","interest rate","bank of england","ons","unemployment","wages","gbp","economy"]
+SPORTS_KW = [
+    "goal", "injury", "transfer", "match", "premier league", "football", "coach", "manager"
+]
+MACRO_KW = [
+    "inflation", "cpi", "ppi", "gdp", "rates", "interest rate", "bank of england", "ons",
+    "unemployment", "wages", "gbp", "economy", "recession", "bond", "yield"
+]
+
 
 # ---------------- DB (persistent dedup) ----------------
 DB_PATH = "state.db"
@@ -86,8 +91,10 @@ def db_has_key(k: str) -> bool:
 def db_insert(k: str, norm: str):
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO posted (k, norm, ts) VALUES (?, ?, ?)",
-                (k, norm, datetime.now(timezone.utc).isoformat()))
+    cur.execute(
+        "INSERT OR IGNORE INTO posted (k, norm, ts) VALUES (?, ?, ?)",
+        (k, norm, datetime.now(timezone.utc).isoformat())
+    )
     con.commit()
     con.close()
 
@@ -99,9 +106,10 @@ def db_recent_norms(limit: int = 400):
     con.close()
     return [r[0] for r in rows if r and r[0]]
 
+
 # ---------------- HELPERS ----------------
 def normalize(text: str) -> str:
-    t = text.lower()
+    t = (text or "").lower()
     t = re.sub(r"[\W_]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
@@ -112,9 +120,10 @@ def make_key(title: str, link: str) -> str:
 
 def classify(title: str, source: str) -> str:
     n = normalize(title)
+    s = (source or "").lower()
 
     # sports first
-    if "sport" in source.lower() or any(k in n for k in SPORTS_KW):
+    if "sport" in s or any(k in n for k in SPORTS_KW):
         return "sports"
 
     # macro only if clearly macro
@@ -125,22 +134,42 @@ def classify(title: str, source: str) -> str:
 
 def why_it_matters(channel: str, title: str):
     n = normalize(title)
+
     if channel == "macro":
         if "inflation" in n or "cpi" in n or "ppi" in n:
-            return ["Rate-cut timing may move", "GBP volatility can pick up", "Mortgage pricing can reprice quickly"]
-        return ["Rate expectations may shift", "Borrowing costs stay sensitive", "GBP & equities can reprice on headlines"]
+            return [
+                "Rate-cut timing may move",
+                "GBP volatility can pick up",
+                "Mortgage pricing can reprice quickly"
+            ]
+        return [
+            "Rate expectations may shift",
+            "Borrowing costs stay sensitive",
+            "GBP & equities can reprice on headlines"
+        ]
+
     if channel == "sports":
-        return ["Squad selection may change", "Momentum/fixtures are affected", "Availability updates move markets/fans"]
-    return ["Fast-moving situation", "Follow-up updates likely", "Knock-on impact possible"]
+        return [
+            "Squad selection may change",
+            "Momentum & fixtures are affected",
+            "Availability updates can shift outcomes"
+        ]
+
+    return [
+        "Fast-moving situation",
+        "Follow-up updates likely",
+        "Knock-on impact possible"
+    ]
 
 def format_msg(channel: str, headline: str, source: str) -> str:
     tag1, tag2 = CHANNEL_HASHTAGS[channel]
     why = why_it_matters(channel, headline)
-    header = "🇬🇧 BREAKING" if channel=="breaking" else ("📊 MACRO" if channel=="macro" else "⚽ SPORTS")
+    header = "🇬🇧 BREAKING" if channel == "breaking" else ("📊 MACRO" if channel == "macro" else "⚽ SPORTS")
+
     return "\n".join([
         header,
         "",
-        headline.upper(),
+        (headline or "").upper(),
         "",
         "Why it matters:",
         f"• {why[0]}",
@@ -169,22 +198,27 @@ async def send(channel: str, text: str):
 
 def fetch_items():
     items = []
+
     for url in BREAKING_FEEDS:
         d = feedparser.parse(url)
         src = d.feed.get("title", "RSS")
         for e in d.entries[:15]:
-            items.append((src, e.get("title","").strip(), e.get("link","").strip()))
+            items.append((src, e.get("title", "").strip(), e.get("link", "").strip()))
+
     for url in MACRO_FEEDS:
         d = feedparser.parse(url)
         src = d.feed.get("title", "RSS")
         for e in d.entries[:15]:
-            items.append((src, e.get("title","").strip(), e.get("link","").strip()))
+            items.append((src, e.get("title", "").strip(), e.get("link", "").strip()))
+
     for url in SPORTS_FEEDS:
         d = feedparser.parse(url)
         src = d.feed.get("title", "RSS")
         for e in d.entries[:15]:
-            items.append((src, e.get("title","").strip(), e.get("link","").strip()))
+            items.append((src, e.get("title", "").strip(), e.get("link", "").strip()))
+
     return items
+
 
 async def main():
     db_init()
@@ -204,19 +238,21 @@ async def main():
             if db_has_key(k):
                 continue
 
-            # soft dedup: similar to recent
-            duplicate_like = any(fuzz.token_set_ratio(norm, rn) >= SIM_THRESHOLD for rn in recent_norms)
-            if duplicate_like:
-                db_insert(k, norm)
+            # soft dedup: similar to recent headlines
+            if any(fuzz.token_set_ratio(norm, rn) >= SIM_THRESHOLD for rn in recent_norms):
+                db_insert(k, norm)  # mark as seen to avoid future repeats
                 continue
 
             ch = classify(title, source)
-            await send(ch, format_msg(ch, title, source))
-db_insert(k, norm)
-await asyncio.sleep(2)
 
+            await send(ch, format_msg(ch, title, source))
+            db_insert(k, norm)
+
+            # small throttle to avoid Telegram flood control
+            await asyncio.sleep(2)
 
         await asyncio.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
