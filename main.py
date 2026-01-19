@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 import feedparser
 from rapidfuzz import fuzz
 from telegram import Bot
+from telegram.error import RetryAfter
+
 
 # ---------------- CONFIG ----------------
 BREAKING_CHAT_ID = int(os.getenv("BREAKING_CHAT_ID", "-1003118967605"))
@@ -151,7 +153,19 @@ def format_msg(channel: str, headline: str, source: str) -> str:
     ])
 
 async def send(channel: str, text: str):
-    await bot.send_message(chat_id=CHANNEL_CHAT_ID[channel], text=text, disable_web_page_preview=True)
+    while True:
+        try:
+            await bot.send_message(
+                chat_id=CHANNEL_CHAT_ID[channel],
+                text=text,
+                disable_web_page_preview=True
+            )
+            return
+        except RetryAfter as e:
+            wait_s = int(getattr(e, "retry_after", 10))
+            print(f"Rate-limited by Telegram. Sleeping {wait_s}s…")
+            await asyncio.sleep(wait_s + 1)
+
 
 def fetch_items():
     items = []
@@ -198,7 +212,9 @@ async def main():
 
             ch = classify(title, source)
             await send(ch, format_msg(ch, title, source))
-            db_insert(k, norm)
+db_insert(k, norm)
+await asyncio.sleep(2)
+
 
         await asyncio.sleep(POLL_SECONDS)
 
