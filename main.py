@@ -39,13 +39,15 @@ DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 
 # Impact threshold (higher = fewer posts, cleaner channel)
 IMPACT_THRESHOLD = float(os.getenv("IMPACT_THRESHOLD", "3.0"))
+
 # Boot protection: do not post old news after restart
-BOOT_LOOKBACK_MINUTES = int(os.getenv("BOOT_LOOKBACK_MINUTES", "10"))  # 10 минут
+BOOT_LOOKBACK_MINUTES = int(os.getenv("BOOT_LOOKBACK_MINUTES", "10"))  # minutes
 BOT_STARTED_AT = datetime.now(timezone.utc)
 
+# =========================
+# RSS FEEDS
+# =========================
 
-
-# RSS feeds (UK-ELITE, Reuters core)
 RSS_FEEDS = [
     # ===== REUTERS (CORE) =====
     "https://feeds.reuters.com/reuters/UKNews",
@@ -157,13 +159,13 @@ async def store_item(conn: aiosqlite.Connection, item: NewsItem) -> None:
         )
         await conn.commit()
     except Exception:
+        # already stored or non-fatal db issue
         pass
 
 
 # =========================
 # FILTERING (WHITELIST / BLACKLIST / IMPACT)
 # =========================
-# Based on your notepad requirements :contentReference[oaicite:2]{index=2}
 
 WHITELIST = [
     # Jobs / labour
@@ -194,14 +196,12 @@ BLACKLIST = [
     "mass abduction", "gunman", "militants",
 ]
 
-# UK relevance helper words (boost score if present)
 UK_HINTS = [
     "uk", "britain", "british", "england", "scotland", "wales", "northern ireland",
     "london", "westminster", "downing street", "hmrc", "ons", "bank of england",
     "sterling", "gbp", "pound",
 ]
 
-# Sources that are inherently “high-signal”
 HIGH_SIGNAL_SOURCES = [
     "office for national statistics",
     "bank of england",
@@ -221,20 +221,10 @@ def text_contains_any(text: str, needles: List[str]) -> bool:
 
 
 def has_numbers(text: str) -> bool:
-    # Any digits like 4.2%, £, $, etc.
     return bool(re.search(r"(\d+(\.\d+)?)|(%|£|\$)", text))
 
 
 def impact_score(item: NewsItem) -> float:
-    """
-    Simple heuristic score:
-    +2 if whitelist hit
-    -3 if blacklist hit
-    +1 if UK hints present
-    +1 if numbers present (suggests “data/impact”)
-    +1 if high-signal source
-    +1 if contains macro trigger terms (CPI/PPI/BoE/Unemployment etc.)
-    """
     title = item.title.lower()
     source = (item.source or "").lower()
     full = f"{title} {source}"
@@ -256,7 +246,10 @@ def impact_score(item: NewsItem) -> float:
     if any(s in source for s in HIGH_SIGNAL_SOURCES):
         score += 1.0
 
-    macro_triggers = ["cpi", "ppi", "inflation", "unemployment", "wages", "bank of england", "boe", "gdp", "pmi", "budget", "mortgage"]
+    macro_triggers = [
+        "cpi", "ppi", "inflation", "unemployment", "wages",
+        "bank of england", "boe", "gdp", "pmi", "budget", "mortgage"
+    ]
     if text_contains_any(full, macro_triggers):
         score += 1.0
 
@@ -264,11 +257,6 @@ def impact_score(item: NewsItem) -> float:
 
 
 def should_publish(item: NewsItem) -> Tuple[bool, float, str]:
-    """
-    Gatekeeping logic:
-    1) Hard reject if blacklist AND no whitelist override.
-    2) Require whitelist OR high impact score.
-    """
     full = f"{item.title} {item.source}".lower()
 
     bl = text_contains_any(full, BLACKLIST)
@@ -276,15 +264,12 @@ def should_publish(item: NewsItem) -> Tuple[bool, float, str]:
 
     score = impact_score(item)
 
-    # Hard reject: blacklist with no whitelist and low score
     if bl and not wl and score < IMPACT_THRESHOLD:
         return False, score, "blacklist"
 
-    # If not whitelist, still allow only if score is high enough (rare)
     if not wl and score < IMPACT_THRESHOLD:
         return False, score, "low_impact"
 
-    # Allow
     return True, score, "ok"
 
 
@@ -293,11 +278,10 @@ def should_publish(item: NewsItem) -> Tuple[bool, float, str]:
 # =========================
 
 def build_message(item: NewsItem, score: float) -> str:
+    hashtags = "#UK #News"
     title = item.title.strip()
     source = (item.source or "").strip()
-    # Keep it clean: 2 hashtags only
-    hashtags = "#UK #News"
-    # Optional: include link in message for Telegram preview
+
     return (
         f"🇬🇧 {hashtags}\n"
         f"{title}\n\n"
@@ -380,7 +364,6 @@ async def fetch_all_feeds() -> List[NewsItem]:
         if isinstance(res, list):
             all_items.extend(res)
 
-    # Dedup within batch
     seen = set()
     unique: List[NewsItem] = []
     for item in all_items:
@@ -398,13 +381,17 @@ async def fetch_all_feeds() -> List[NewsItem]:
 # =========================
 
 def resolve_channel_target() -> Tuple[Optional[int], Optional[str]]:
-    cid = None
+    cid: Optional[int] = None
     if CHANNEL_CHAT_ID:
         try:
             cid = int(CHANNEL_CHAT_ID)
         except ValueError:
             cid = None
-    uname = CHANNEL_USERNAME if CHANNEL_USERNAME.startswith("@") else (f"@{CHANNEL_USERNAME}" if CHANNEL_USERNAME else "")
+
+    uname = CHANNEL_USERNAME.strip()
+    if uname and not uname.startswith("@"):
+        uname = f"@{uname}"
+
     return cid, (uname or None)
 
 
@@ -434,33 +421,48 @@ async def send_message_with_retry(bot: Bot, chat_id: Optional[int], username: Op
 # MAIN LOOP
 # =========================
 
+def _normalize_published_dt(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
     logger.info("Fetching RSS feeds...")
     items = await fetch_all_feeds()
     logger.info("Fetched %d items from feeds", len(items))
 
-    items.sort(key=lambda x: x.published or datetime.utcnow())
+    # Normalize published times and sort
+    for i in items:
+        i.published = _normalize_published_dt(i.published)
+
+    items.sort(key=lambda x: x.published or datetime.now(timezone.utc))
 
     chat_id, username = resolve_channel_target()
 
-   for item in items:
-    if await is_duplicate(conn, item):
-        continue
+    for item in items:
+        if not item.title or not item.link:
+            continue
 
-   
-    ok, score, reason = should_publish(item)
-    if not ok:
-        logger.info("SKIP (reason=%s score=%.1f): %s", reason, score, item.title)
-        continue
+        # Dedup (DB + fuzzy)
+        if await is_duplicate(conn, item):
+            continue
 
-    ...
-
-
-
+        # --- BOOT LOCKOUT: skip old items after restart (anti-flood) ---
+        if item.published is not None:
+            boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
+            if item.published < boot_cutoff:
+                logger.info("SKIP (boot_lockout %sm): %s", BOOT_LOOKBACK_MINUTES, item.title)
+                # still store so we never post it later
+                await store_item(conn, item)
+                continue
 
         ok, score, reason = should_publish(item)
         if not ok:
             logger.info("SKIP (reason=%s score=%.1f): %s", reason, score, item.title)
+            await store_item(conn, item)
             continue
 
         msg = build_message(item, score)
@@ -473,9 +475,6 @@ async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
         return
-
-    # IMPORTANT: Make sure the bot is admin in the channel
-    # and has permission to post.
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     conn = await init_db(DB_PATH)
@@ -490,8 +489,8 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
 
     logger.info(
-        "UK Single-Channel News bot started. Poll interval: %s sec | Impact threshold: %.1f",
-        POLL_SECONDS, IMPACT_THRESHOLD
+        "UK Single-Channel News bot started. Poll interval: %s sec | Impact threshold: %.1f | Boot lockout: %s min",
+        POLL_SECONDS, IMPACT_THRESHOLD, BOOT_LOOKBACK_MINUTES
     )
 
     try:
