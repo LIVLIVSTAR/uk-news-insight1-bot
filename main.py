@@ -40,23 +40,27 @@ DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 # Impact threshold (higher = fewer posts, cleaner channel)
 IMPACT_THRESHOLD = float(os.getenv("IMPACT_THRESHOLD", "3.0"))
 
-# RSS feeds (UK-focused, NO world feeds)
+# RSS feeds (UK-ELITE, Reuters core)
 RSS_FEEDS = [
-    # BBC
+    # ===== REUTERS (CORE) =====
+    "https://feeds.reuters.com/reuters/UKNews",
+    "https://feeds.reuters.com/reuters/UKBusiness",
+    "https://feeds.reuters.com/reuters/UKPolitics",
+    "https://feeds.reuters.com/reuters/economicNews",
+
+    # ===== BBC (UK only) =====
     "https://feeds.bbci.co.uk/news/uk/rss.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
 
-    # Sky UK
+    # ===== SKY (UK) =====
     "https://feeds.skynews.com/feeds/rss/uk.xml",
 
-    # Official data & institutions
-    "https://www.ons.gov.uk/rss",  # ONS general RSS (we filter by keywords)
-    "https://www.bankofengland.co.uk/rss/news",  # BoE news
-
-    # UK Government news (often policy/regulation)
+    # ===== OFFICIAL DATA =====
+    "https://www.ons.gov.uk/rss",
+    "https://www.bankofengland.co.uk/rss/news",
     "https://www.gov.uk/search/news-and-communications.atom",
 
-    # Business / policy analysis (UK)
+    # ===== ANALYSIS / THINK TANKS =====
     "https://www.theguardian.com/uk/business/rss",
     "https://www.resolutionfoundation.org/feed/",
     "https://ifs.org.uk/rss.xml",
