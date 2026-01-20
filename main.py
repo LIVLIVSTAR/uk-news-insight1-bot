@@ -49,29 +49,40 @@ BOT_STARTED_AT = datetime.now(timezone.utc)
 # =========================
 
 RSS_FEEDS = [
-    # ===== REUTERS (CORE) =====
-    "https://feeds.reuters.com/reuters/UKNews",
-    "https://feeds.reuters.com/reuters/UKBusiness",
-    "https://feeds.reuters.com/reuters/UKPolitics",
-    "https://feeds.reuters.com/reuters/economicNews",
+    # ===== REUTERS (mirrors, UK locked) =====
+    "https://news.google.com/rss/search?q=site:reuters.com+UK&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:reuters.com+Bank+of+England&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:reuters.com+UK+inflation&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:reuters.com+UK+employment&hl=en-GB&gl=GB&ceid=GB:en",
 
-    # ===== BBC (UK only) =====
+    # ===== BLOOMBERG UK =====
+    "https://news.google.com/rss/search?q=site:bloomberg.com+UK&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:bloomberg.com+Bank+of+England&hl=en-GB&gl=GB&ceid=GB:en",
+
+    # ===== FINANCIAL TIMES =====
+    "https://news.google.com/rss/search?q=site:ft.com+UK&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:ft.com+UK+economy&hl=en-GB&gl=GB&ceid=GB:en",
+
+    # ===== GOV.UK =====
+    "https://news.google.com/rss/search?q=site:gov.uk+policy&hl=en-GB&gl=GB&ceid=GB:en",
+    "https://news.google.com/rss/search?q=site:gov.uk+consultation&hl=en-GB&gl=GB&ceid=GB:en",
+
+    # ===== BANK OF ENGLAND =====
+    "https://news.google.com/rss/search?q=site:bankofengland.co.uk&hl=en-GB&gl=GB&ceid=GB:en",
+
+    # ===== GUARDIAN =====
+    "https://www.theguardian.com/politics/rss",
+    "https://www.theguardian.com/uk/business/rss",
+
+    # ===== BBC / SKY =====
     "https://feeds.bbci.co.uk/news/uk/rss.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
-
-    # ===== SKY (UK) =====
     "https://feeds.skynews.com/feeds/rss/uk.xml",
-
-    # ===== OFFICIAL DATA =====
-    "https://www.ons.gov.uk/rss",
-    "https://www.bankofengland.co.uk/rss/news",
-    "https://www.gov.uk/search/news-and-communications.atom",
-
-    # ===== ANALYSIS / THINK TANKS =====
-    "https://www.theguardian.com/uk/business/rss",
-    "https://www.resolutionfoundation.org/feed/",
-    "https://ifs.org.uk/rss.xml",
 ]
+
+
+
+
 
 FUZZY_LOOKBACK_MINUTES = 180
 
