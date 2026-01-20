@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import signal
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
@@ -21,25 +22,44 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("uk_news_bot")
+logger = logging.getLogger("uk_single_channel_news_bot")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-BREAKING_CHAT_ID = int(os.getenv("BREAKING_CHAT_ID", "0"))
-MACRO_CHAT_ID = int(os.getenv("MACRO_CHAT_ID", "0"))
-SPORTS_CHAT_ID = int(os.getenv("SPORTS_CHAT_ID", "0"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# You can set either:
+# 1) CHANNEL_CHAT_ID (recommended): numeric id like -100xxxxxxxxxx
+# OR
+# 2) CHANNEL_USERNAME: like @Uk_breaking_newss
+CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID", "").strip()
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "").strip()
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "600"))
 SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.92"))
 DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 
+# Impact threshold (higher = fewer posts, cleaner channel)
+IMPACT_THRESHOLD = float(os.getenv("IMPACT_THRESHOLD", "3.0"))
+
+# RSS feeds (UK-focused, NO world feeds)
 RSS_FEEDS = [
+    # BBC
     "https://feeds.bbci.co.uk/news/uk/rss.xml",
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://feeds.bbci.co.uk/sport/rss.xml",
+
+    # Sky UK
     "https://feeds.skynews.com/feeds/rss/uk.xml",
-    "https://feeds.skynews.com/feeds/rss/world.xml",
-    "https://www.ons.gov.uk/rss",
+
+    # Official data & institutions
+    "https://www.ons.gov.uk/rss",  # ONS general RSS (we filter by keywords)
+    "https://www.bankofengland.co.uk/rss/news",  # BoE news
+
+    # UK Government news (often policy/regulation)
+    "https://www.gov.uk/search/news-and-communications.atom",
+
+    # Business / policy analysis (UK)
+    "https://www.theguardian.com/uk/business/rss",
+    "https://www.resolutionfoundation.org/feed/",
+    "https://ifs.org.uk/rss.xml",
 ]
 
 FUZZY_LOOKBACK_MINUTES = 180
@@ -128,89 +148,153 @@ async def store_item(conn: aiosqlite.Connection, item: NewsItem) -> None:
         )
         await conn.commit()
     except Exception:
-        # Already stored or other non-fatal DB issue
         pass
 
 
 # =========================
-# CLASSIFICATION
+# FILTERING (WHITELIST / BLACKLIST / IMPACT)
+# =========================
+# Based on your notepad requirements :contentReference[oaicite:2]{index=2}
+
+WHITELIST = [
+    # Jobs / labour
+    "employment", "jobs", "job", "unemployment", "wages", "pay growth", "labour market", "labor market",
+    # BoE / rates
+    "bank of england", "boe", "rate", "rates", "interest rate", "interest rates", "minutes",
+    # Inflation / macro
+    "inflation", "cpi", "ppi", "core", "gdp", "pmi", "retail sales",
+    # Housing / mortgages / taxes
+    "mortgage", "housing", "rent", "house prices", "tax", "budget", "benefits",
+    # Politics / regulation (major decisions)
+    "bill", "law", "ban", "reform", "policy", "parliament", "government",
+    # Big UK companies examples
+    "bp", "shell", "barclays", "hsbc", "lloyds", "tesco", "sainsbury", "vodafone", "bt", "rolls-royce",
+    # UK football only
+    "premier league", "epl", "fa cup", "carabao cup",
+]
+
+BLACKLIST = [
+    # human interest / tragedy / noise
+    "tumour", "tumor", "teenage", "brain", "inoperable", "cancer",
+    "missing", "abduction", "kidnapped", "kidnap",
+    "injured", "injuries", "dead", "died", "killed", "murder", "rape",
+    "police said", "police say", "arrested", "shooting", "stabbing",
+    "church",
+    "denied reports",
+    # often non-UK geopolitical crime/war noise
+    "mass abduction", "gunman", "militants",
+]
+
+# UK relevance helper words (boost score if present)
+UK_HINTS = [
+    "uk", "britain", "british", "england", "scotland", "wales", "northern ireland",
+    "london", "westminster", "downing street", "hmrc", "ons", "bank of england",
+    "sterling", "gbp", "pound",
+]
+
+# Sources that are inherently “high-signal”
+HIGH_SIGNAL_SOURCES = [
+    "office for national statistics",
+    "bank of england",
+    "gov.uk",
+    "institute for fiscal studies",
+    "resolution foundation",
+    "bbc news - uk",
+    "bbc news - business",
+    "sky news - uk",
+    "the guardian",
+]
+
+
+def text_contains_any(text: str, needles: List[str]) -> bool:
+    t = text.lower()
+    return any(n in t for n in needles)
+
+
+def has_numbers(text: str) -> bool:
+    # Any digits like 4.2%, £, $, etc.
+    return bool(re.search(r"(\d+(\.\d+)?)|(%|£|\$)", text))
+
+
+def impact_score(item: NewsItem) -> float:
+    """
+    Simple heuristic score:
+    +2 if whitelist hit
+    -3 if blacklist hit
+    +1 if UK hints present
+    +1 if numbers present (suggests “data/impact”)
+    +1 if high-signal source
+    +1 if contains macro trigger terms (CPI/PPI/BoE/Unemployment etc.)
+    """
+    title = item.title.lower()
+    source = (item.source or "").lower()
+    full = f"{title} {source}"
+
+    score = 0.0
+
+    if text_contains_any(full, BLACKLIST):
+        score -= 3.0
+
+    if text_contains_any(full, WHITELIST):
+        score += 2.0
+
+    if text_contains_any(full, UK_HINTS):
+        score += 1.0
+
+    if has_numbers(item.title):
+        score += 1.0
+
+    if any(s in source for s in HIGH_SIGNAL_SOURCES):
+        score += 1.0
+
+    macro_triggers = ["cpi", "ppi", "inflation", "unemployment", "wages", "bank of england", "boe", "gdp", "pmi", "budget", "mortgage"]
+    if text_contains_any(full, macro_triggers):
+        score += 1.0
+
+    return score
+
+
+def should_publish(item: NewsItem) -> Tuple[bool, float, str]:
+    """
+    Gatekeeping logic:
+    1) Hard reject if blacklist AND no whitelist override.
+    2) Require whitelist OR high impact score.
+    """
+    full = f"{item.title} {item.source}".lower()
+
+    bl = text_contains_any(full, BLACKLIST)
+    wl = text_contains_any(full, WHITELIST)
+
+    score = impact_score(item)
+
+    # Hard reject: blacklist with no whitelist and low score
+    if bl and not wl and score < IMPACT_THRESHOLD:
+        return False, score, "blacklist"
+
+    # If not whitelist, still allow only if score is high enough (rare)
+    if not wl and score < IMPACT_THRESHOLD:
+        return False, score, "low_impact"
+
+    # Allow
+    return True, score, "ok"
+
+
+# =========================
+# MESSAGE FORMAT (CLEAN, 2 HASHTAGS)
 # =========================
 
-MACRO_KEYWORDS = [
-    "inflation", "cpi", "ppi", "gdp", "recession",
-    "interest rate", "interest rates", "bank of england", "boe",
-    "bond yields", "gilts", "unemployment", "wages", "labour market",
-    "labor market", "sterling", "gbp", "pound",
-]
-
-SPORTS_KEYWORDS = [
-    "football", "premier league", "championship", "fa cup", "carabao cup",
-    "goal", "goals", "match", "fixture", "injury", "injuries",
-    "transfer", "transfers", "manager", "coach", "team", "club",
-]
-
-POLITICS_KEYWORDS = [
-    "prime minister", "pm", "downing street", "parliament", "mp", "mps",
-    "labour", "labour party", "conservative", "conservatives", "tory",
-    "tories", "election", "by-election", "referendum", "government",
-    "minister", "cabinet", "home office", "foreign office",
-]
-
-CELEBRITY_KEYWORDS = [
-    "celebrity", "royal", "royals", "prince", "princess", "duke",
-    "duchess", "king", "queen", "actor", "actress", "singer",
-    "musician", "tv star", "reality star",
-]
-
-
-class Category:
-    BREAKING = "BREAKING"
-    MACRO = "MACRO"
-    SPORTS = "SPORTS"
-
-
-def classify_news(item: NewsItem) -> Category:
-    text = f"{item.title} {item.source}".lower()
-
-    def has(words: List[str]) -> bool:
-        return any(w in text for w in words)
-
-    # Sports first
-    if has(SPORTS_KEYWORDS):
-        return Category.SPORTS
-
-    # Macro only if macro and not politics/celebrity
-    if has(MACRO_KEYWORDS) and not (has(POLITICS_KEYWORDS) or has(CELEBRITY_KEYWORDS)):
-        return Category.MACRO
-
-    # Default: breaking
-    return Category.BREAKING
-
-
-def category_to_header_and_chat_id(category: Category) -> Tuple[str, int]:
-    if category == Category.BREAKING:
-        return "🇬🇧", BREAKING_CHAT_ID
-    if category == Category.MACRO:
-        return "📊", MACRO_CHAT_ID
-    if category == Category.SPORTS:
-        return "⚽", SPORTS_CHAT_ID
-    return "🇬🇧", BREAKING_CHAT_ID
-
-
-# =========================
-# MESSAGE FORMAT (MARKETTWITS STYLE)
-# =========================
-
-def build_message(item: NewsItem, category: Category) -> str:
-    emoji, _ = category_to_header_and_chat_id(category)
+def build_message(item: NewsItem, score: float) -> str:
     title = item.title.strip()
-    source = (item.source or "").strip().lower() or "unknown"
-    hashtags = f"#{category.lower()} #uk"
-
+    source = (item.source or "").strip()
+    # Keep it clean: 2 hashtags only
+    hashtags = "#UK #News"
+    # Optional: include link in message for Telegram preview
     return (
-        f"{emoji} {hashtags}\n"
+        f"🇬🇧 {hashtags}\n"
         f"{title}\n\n"
-        f"{source}"
+        f"{source}\n"
+        f"{item.link}\n"
+        f"Impact: {score:.1f}"
     )
 
 
@@ -240,16 +324,22 @@ async def fetch_rss_feed(session: aiohttp.ClientSession, url: str) -> List[NewsI
     if channel is None:
         channel = root
 
-    for item in channel.findall("item"):
-        title_el = item.find("title")
-        link_el = item.find("link")
-        pub_el = item.find("pubDate")
+    channel_title_el = channel.find("title")
+    channel_title = channel_title_el.text.strip() if (channel_title_el is not None and channel_title_el.text) else url
+
+    for it in channel.findall("item"):
+        title_el = it.find("title")
+        link_el = it.find("link")
+        pub_el = it.find("pubDate")
 
         if title_el is None or link_el is None:
             continue
 
-        title = title_el.text or ""
-        link = link_el.text or ""
+        title = (title_el.text or "").strip()
+        link = (link_el.text or "").strip()
+
+        if not title or not link:
+            continue
 
         published: Optional[datetime] = None
         if pub_el is not None and pub_el.text:
@@ -259,14 +349,11 @@ async def fetch_rss_feed(session: aiohttp.ClientSession, url: str) -> List[NewsI
             except Exception:
                 published = None
 
-        source_el = channel.find("title")
-        source_name = source_el.text if source_el is not None and source_el.text else url
-
         items.append(
             NewsItem(
-                title=title.strip(),
-                link=link.strip(),
-                source=source_name.strip(),
+                title=title,
+                link=link,
+                source=channel_title,
                 published=published,
             )
         )
@@ -301,12 +388,26 @@ async def fetch_all_feeds() -> List[NewsItem]:
 # TELEGRAM SENDER
 # =========================
 
-async def send_message_with_retry(bot: Bot, chat_id: int, text: str) -> None:
-    # basic spacing to avoid flood
-    await asyncio.sleep(2)
+def resolve_channel_target() -> Tuple[Optional[int], Optional[str]]:
+    cid = None
+    if CHANNEL_CHAT_ID:
+        try:
+            cid = int(CHANNEL_CHAT_ID)
+        except ValueError:
+            cid = None
+    uname = CHANNEL_USERNAME if CHANNEL_USERNAME.startswith("@") else (f"@{CHANNEL_USERNAME}" if CHANNEL_USERNAME else "")
+    return cid, (uname or None)
+
+
+async def send_message_with_retry(bot: Bot, chat_id: Optional[int], username: Optional[str], text: str) -> None:
+    await asyncio.sleep(1.5)
     while True:
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            target = chat_id if chat_id is not None else username
+            if not target:
+                logger.error("No channel target configured. Set CHANNEL_CHAT_ID or CHANNEL_USERNAME.")
+                return
+            await bot.send_message(chat_id=target, text=text, disable_web_page_preview=False)
             break
         except RetryAfter as e:
             delay = getattr(e, "retry_after", 5)
@@ -331,22 +432,20 @@ async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
 
     items.sort(key=lambda x: x.published or datetime.utcnow())
 
-    for item in items:
-        if not item.title or not item.link:
-            continue
+    chat_id, username = resolve_channel_target()
 
+    for item in items:
         if await is_duplicate(conn, item):
             continue
 
-        category = classify_news(item)
-        _, chat_id = category_to_header_and_chat_id(category)
-        if chat_id == 0:
-            logger.warning("Chat ID for category %s not configured, skipping", category)
+        ok, score, reason = should_publish(item)
+        if not ok:
+            logger.info("SKIP (reason=%s score=%.1f): %s", reason, score, item.title)
             continue
 
-        msg = build_message(item, category)
-        logger.info("Posting [%s] %s", category, item.title)
-        await send_message_with_retry(bot, chat_id, msg)
+        msg = build_message(item, score)
+        logger.info("POST (score=%.1f): %s", score, item.title)
+        await send_message_with_retry(bot, chat_id, username, msg)
         await store_item(conn, item)
 
 
@@ -354,6 +453,9 @@ async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Exiting.")
         return
+
+    # IMPORTANT: Make sure the bot is admin in the channel
+    # and has permission to post.
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     conn = await init_db(DB_PATH)
@@ -367,7 +469,10 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    logger.info("UK News bot started. Poll interval: %s seconds", POLL_SECONDS)
+    logger.info(
+        "UK Single-Channel News bot started. Poll interval: %s sec | Impact threshold: %.1f",
+        POLL_SECONDS, IMPACT_THRESHOLD
+    )
 
     try:
         while not stop_event.is_set():
