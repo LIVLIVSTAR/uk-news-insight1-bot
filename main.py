@@ -39,6 +39,10 @@ DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 
 # Impact threshold (higher = fewer posts, cleaner channel)
 IMPACT_THRESHOLD = float(os.getenv("IMPACT_THRESHOLD", "3.0"))
+# Boot protection: do not post old news after restart
+BOOT_LOOKBACK_MINUTES = int(os.getenv("BOOT_LOOKBACK_MINUTES", "10"))  # 10 минут
+BOT_STARTED_AT = datetime.utcnow()
+
 
 # RSS feeds (UK-ELITE, Reuters core)
 RSS_FEEDS = [
@@ -441,6 +445,13 @@ async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
     for item in items:
         if await is_duplicate(conn, item):
             continue
+                    # --- BOOT LOCKOUT (anti-flood after redeploy) ---
+        if item.published:
+            boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
+            if item.published < boot_cutoff:
+                logger.info("SKIP (boot_lockout %sm): %s", BOOT_LOOKBACK_MINUTES, item.title)
+                continue
+
 
         ok, score, reason = should_publish(item)
         if not ok:
