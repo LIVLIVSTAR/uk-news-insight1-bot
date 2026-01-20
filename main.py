@@ -179,21 +179,83 @@ async def store_item(conn: aiosqlite.Connection, item: NewsItem) -> None:
 # =========================
 
 WHITELIST = [
-    # Jobs / labour
-    "employment", "jobs", "job", "unemployment", "wages", "pay growth", "labour market", "labor market",
-    # BoE / rates
-    "bank of england", "boe", "rate", "rates", "interest rate", "interest rates", "minutes",
-    # Inflation / macro
-    "inflation", "cpi", "ppi", "core", "gdp", "pmi", "retail sales",
-    # Housing / mortgages / taxes
-    "mortgage", "housing", "rent", "house prices", "tax", "budget", "benefits",
-    # Politics / regulation (major decisions)
-    "bill", "law", "ban", "reform", "policy", "parliament", "government",
-    # Big UK companies examples
-    "bp", "shell", "barclays", "hsbc", "lloyds", "tesco", "sainsbury", "vodafone", "bt", "rolls-royce",
-    # UK football only
-    "premier league", "epl", "fa cup", "carabao cup",
+    # ===== CRYPTO / METALS / PRICES =====
+    "btc", "bitcoin", "crypto", "cryptocurrency",
+    "gold", "silver",
+    "price", "prices", "high prices", "cost of living",
+    "inflation", "cpi", "ppi",
+
+    # ===== MACRO / LABOUR =====
+    "employment", "jobs", "job market", "unemployment",
+    "wages", "salary", "salaries", "pay", "pay growth",
+    "labour market",
+
+    # ===== BENEFITS / SOCIAL =====
+    "universal credit", "benefits", "pension", "pensions",
+    "state pension", "triple lock",
+    "disability benefits", "housing benefit",
+
+    # ===== MONEY / MARKETS =====
+    "bond", "bonds", "gilts", "yield", "yields", "gilt yields",
+    "ftse", "ftse 100", "ftse 250",
+    "stocks", "equities", "shares",
+    "sterling", "gbp", "pound", "exchange rate",
+    "interest rate", "interest rates",
+    "bank of england", "boe",
+
+    # ===== TAX / BUDGET =====
+    "budget", "spring budget", "autumn statement",
+    "tax", "tax cut", "tax rise",
+    "hm treasury", "hmrc",
+
+    # ===== ENERGY =====
+    "energy", "energy bills", "energy cap",
+    "gas prices", "electricity prices",
+    "ofgem", "utilities",
+
+    # ===== HOUSING =====
+    "mortgage", "mortgages", "housing",
+    "house prices", "rent", "rents",
+    "landlord", "renters",
+    "leasehold", "freehold",
+    "rightmove", "zoopla",
+
+    # ===== GOVERNMENT / REGULATION =====
+    "consultation", "white paper", "green paper",
+    "regulation", "regulator",
+    "policy", "reform", "bill", "law",
+
+    # ===== IMMIGRATION / SECURITY =====
+    "immigration", "asylum",
+    "small boats", "boat crossings", "boats",
+    "border", "home office",
+
+    # ===== GEOPOLITICS (UK-RELEVANT) =====
+    "greenland", "war", "conflict",
+    "sanctions", "nato", "defence",
+    "national security",
+    "mi5", "gchq",
+
+    # ===== STRIKES / INFRASTRUCTURE =====
+    "strike", "strikes",
+    "rail strike", "train strike",
+    "junior doctors", "nurses",
+    "nhs", "waiting times",
+    "rail", "trains", "tfl", "hs2",
+
+    # ===== POLITICS =====
+    "election", "polls",
+    "labour", "conservative", "reform uk",
+    "prime minister", "downing street",
+    "parliament", "westminster",
+
+    # ===== MAJOR UK COMPANIES =====
+    "bp", "shell", "hsbc", "barclays", "lloyds",
+    "tesco", "sainsbury", "vodafone",
+    "bt", "rolls-royce",
 ]
+
+
 
 BLACKLIST = [
     # human interest / tragedy / noise
