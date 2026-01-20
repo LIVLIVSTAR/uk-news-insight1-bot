@@ -443,24 +443,29 @@ async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
 
     chat_id, username = resolve_channel_target()
 
-    for item in items:
-        if await is_duplicate(conn, item):
-            continue
-                  # --- BOOT LOCKOUT (anti-flood after redeploy) ---
-if item.published:
-    pub = item.published
-    if pub.tzinfo is None:
-        pub = pub.replace(tzinfo=timezone.utc)
-
-    boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
-
-    if pub < boot_cutoff:
-        logger.info(
-            "SKIP (boot_lockout %sm): %s",
-            BOOT_LOOKBACK_MINUTES,
-            item.title
-        )
+   for item in items:
+    if await is_duplicate(conn, item):
         continue
+
+    # --- BOOT LOCKOUT (anti-flood after redeploy) ---
+    if item.published:
+        pub = item.published
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+
+        boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
+
+        if pub < boot_cutoff:
+            logger.info("SKIP (boot_lockout %sm): %s", BOOT_LOOKBACK_MINUTES, item.title)
+            continue
+
+    ok, score, reason = should_publish(item)
+    if not ok:
+        logger.info("SKIP (reason=%s score=%.1f): %s", reason, score, item.title)
+        continue
+
+    ...
+
 
 
 
