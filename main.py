@@ -5,7 +5,7 @@ import os
 import signal
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 import aiohttp
@@ -41,7 +41,8 @@ DB_PATH = os.getenv("DB_PATH", "news_bot.db")
 IMPACT_THRESHOLD = float(os.getenv("IMPACT_THRESHOLD", "3.0"))
 # Boot protection: do not post old news after restart
 BOOT_LOOKBACK_MINUTES = int(os.getenv("BOOT_LOOKBACK_MINUTES", "10"))  # 10 минут
-BOT_STARTED_AT = datetime.utcnow()
+BOT_STARTED_AT = datetime.now(timezone.utc)
+
 
 
 # RSS feeds (UK-ELITE, Reuters core)
@@ -445,12 +446,22 @@ async def process_news_cycle(bot: Bot, conn: aiosqlite.Connection) -> None:
     for item in items:
         if await is_duplicate(conn, item):
             continue
-                    # --- BOOT LOCKOUT (anti-flood after redeploy) ---
-        if item.published:
-            boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
-            if item.published < boot_cutoff:
-                logger.info("SKIP (boot_lockout %sm): %s", BOOT_LOOKBACK_MINUTES, item.title)
-                continue
+                  # --- BOOT LOCKOUT (anti-flood after redeploy) ---
+if item.published:
+    pub = item.published
+    if pub.tzinfo is None:
+        pub = pub.replace(tzinfo=timezone.utc)
+
+    boot_cutoff = BOT_STARTED_AT - timedelta(minutes=BOOT_LOOKBACK_MINUTES)
+
+    if pub < boot_cutoff:
+        logger.info(
+            "SKIP (boot_lockout %sm): %s",
+            BOOT_LOOKBACK_MINUTES,
+            item.title
+        )
+        continue
+
 
 
         ok, score, reason = should_publish(item)
